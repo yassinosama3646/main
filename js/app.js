@@ -4,11 +4,21 @@
   const { EXERCISES, SPLITS, PHASES, TOTAL_DAYS, GUIDE, MEALS, DEFAULT_SETTINGS } = window.R100;
   const KEY = 'rebuild100.v1';
 
-  /* ---------- state ---------- */
+  /* ---------- state + persistence ----------
+     Source of truth while the page runs: `state` (in memory).
+     Durable copies: localStorage (always, instant) and the artifact's `db` capability
+     (when the claude.ai viewer grants it: survives reloads, devices and republishes).
+     Every record carries `updatedAt`; newer wins on merge. Unsynced changes are kept
+     in a pending queue that is itself persisted, so a killed tab loses nothing. */
+  const PENDING_KEY = KEY + '.pending';
   let state = load();
+  let pending = loadPending();          // path -> body | null (delete), awaiting a db write
+  let baseline = new Map();             // path -> signature of the last persisted body
+  let db = null, dbState = 'off', dbErr = null, flushing = false, flushT = null, failures = 0;
   let viewDate = todayStr();
   let activeTab = 'today';
   let restTimer = null;
+  const COLLECTIONS = ['sessions', 'body', 'habits', 'settings'];
 
   function load() {
     let s = null;
@@ -16,15 +26,158 @@
     s = s || {};
     s.settings = Object.assign({}, DEFAULT_SETTINGS, s.settings || {});
     s.sessions = s.sessions || {};
-    s.body = s.body || [];
+    s.body = Array.isArray(s.body) ? s.body : [];
     s.habits = s.habits || {};
     return s;
+  }
+  function loadPending() {
+    try { const a = JSON.parse(localStorage.getItem(PENDING_KEY) || '[]'); return new Map(Array.isArray(a) ? a : []); } catch (e) { return new Map(); }
+  }
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const sig = (body) => JSON.stringify(body, (k, v) => k === 'updatedAt' ? undefined : v);
+
+  /* Flattened view: db path -> the live state object that is the document body. */
+  function records() {
+    const m = new Map();
+    Object.keys(state.sessions).forEach(d => { if (state.sessions[d]) m.set('sessions/' + d, state.sessions[d]); });
+    state.body.forEach(b => { if (b && b.date) m.set('body/' + b.date, b); });
+    Object.keys(state.habits).forEach(d => { if (state.habits[d]) m.set('habits/' + d, state.habits[d]); });
+    m.set('settings/main', state.settings);
+    return m;
+  }
+  function rebuildBaseline() { baseline = new Map(); records().forEach((b, p) => baseline.set(p, sig(b))); }
+  rebuildBaseline();
+
+  /* Compare live state with the last persisted signatures; stamp and queue what changed. */
+  function diffAndQueue() {
+    const now = Date.now();
+    const live = records();
+    live.forEach((body, path) => {
+      const sg = sig(body);
+      if (baseline.get(path) !== sg) { body.updatedAt = now; baseline.set(path, sg); pending.set(path, clone(body)); }
+    });
+    Array.from(baseline.keys()).forEach(path => { if (!live.has(path)) { baseline.delete(path); pending.set(path, null); } });
+  }
+  function persistLocal() {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+    try { localStorage.setItem(PENDING_KEY, JSON.stringify(Array.from(pending.entries()))); } catch (e) { /* storage unavailable */ }
   }
   let saveT = null;
   function save(now) {
     clearTimeout(saveT);
-    const doSave = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ } };
-    if (now) doSave(); else saveT = setTimeout(doSave, 250);
+    const run = () => { diffAndQueue(); persistLocal(); scheduleFlush(0); };
+    if (now) run(); else saveT = setTimeout(run, 250);
+  }
+  window.addEventListener('pagehide', () => save(true));
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') save(true); });
+
+  /* ----- db sync ----- */
+  function setDbState(st, err) { dbState = st; dbErr = err || null; renderSyncState(); }
+  function renderSyncState() {
+    const elx = document.getElementById('syncstate'); if (!elx) return;
+    const n = pending.size;
+    const map = {
+      off: 'Saved on this device only · back up weekly in Settings',
+      connecting: 'Connecting to your account…',
+      syncing: `Syncing ${n} change${n === 1 ? '' : 's'}…`,
+      synced: 'Saved on this device and in your account',
+      error: `Saved on device · ${n} change${n === 1 ? '' : 's'} waiting to sync (retrying)`,
+    };
+    elx.textContent = map[dbState] || '';
+    elx.dataset.state = dbState;
+  }
+  function scheduleFlush(ms) { if (!db) return; clearTimeout(flushT); flushT = setTimeout(flush, ms || 0); }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  async function flush() {
+    if (!db || flushing) return;
+    if (!pending.size) { setDbState('synced'); return; }
+    flushing = true; setDbState('syncing');
+    try {
+      while (pending.size) {
+        const [path, body] = pending.entries().next().value;
+        pending.delete(path);
+        try {
+          if (body === null) await db.doc(path).delete(); else await db.doc(path).set(body);
+          failures = 0; persistLocal(); renderSyncState();
+        } catch (e) {
+          const code = e && e.code;
+          if (code === 'invalid_argument' || code === 'transform_error') { failures = 0; persistLocal(); continue; } // this body can never be written; a newer queued one (if any) still will
+          if (!pending.has(path)) pending.set(path, body);   // a newer queued body wins over the failed one
+          persistLocal();
+          failures += 1;
+          if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') { db = null; setDbState('off'); return; }
+          if (failures >= 3) { setDbState('error', e); scheduleFlush(15000); return; }
+          await sleep(400 + Math.random() * 600);
+        }
+      }
+      setDbState('synced');
+    } finally { flushing = false; }
+  }
+  function docPath(col, id) { return col + '/' + id; }
+  function applyRemote(path, body) {
+    const [col, id] = path.split('/');
+    if (!id || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(id) && col !== 'settings') return false;
+    if (col === 'sessions') state.sessions[id] = body;
+    else if (col === 'habits') state.habits[id] = body;
+    else if (col === 'body') { state.body = state.body.filter(b => b.date !== id); state.body.push(Object.assign({ date: id }, body)); }
+    else if (col === 'settings') { if (id !== 'main') return false; state.settings = Object.assign({}, DEFAULT_SETTINGS, body); }
+    else return false;
+    baseline.set(path, sig(body));
+    return true;
+  }
+  function removeLocal(path) {
+    const [col, id] = path.split('/');
+    if (col === 'sessions') delete state.sessions[id];
+    else if (col === 'habits') delete state.habits[id];
+    else if (col === 'body') state.body = state.body.filter(b => b.date !== id);
+    else return false;
+    baseline.delete(path);
+    return true;
+  }
+  const ts = (b) => (b && typeof b.updatedAt === 'number') ? b.updatedAt : 0;
+
+  async function connectDb() {
+    if (!(window.claude && typeof window.claude.use === 'function')) { setDbState('off'); return; }
+    setDbState('connecting');
+    try { db = await window.claude.use('db'); } catch (e) { db = null; }
+    if (!db) { setDbState('off'); return; }
+    try { await initialMerge(); } catch (e) { setDbState('error', e); scheduleFlush(5000); return; }
+    subscribeRemote();
+    scheduleFlush(0);
+  }
+  async function initialMerge() {
+    const remote = new Map();
+    for (const c of COLLECTIONS) {
+      const snap = await db.collection(c).get();
+      snap.docs.forEach(d => { if (d.exists) remote.set(docPath(c, d.id), d.data()); });
+    }
+    const local = records();
+    let changed = false;
+    const paths = new Set([...remote.keys(), ...local.keys()]);
+    paths.forEach(path => {
+      const r = remote.get(path), l = local.get(path);
+      if (pending.has(path) && pending.get(path) === null) return;        // a local delete is still queued: it wins
+      const rt = r ? ts(r) : -1, lt = l ? ts(l) : -1;
+      if (r && rt > lt) { if (applyRemote(path, clone(r))) { pending.delete(path); changed = true; } }
+      else if (l && (!r || lt > rt)) { if (!l.updatedAt) l.updatedAt = Date.now(); baseline.set(path, sig(l)); pending.set(path, clone(l)); }
+    });
+    persistLocal();
+    if (changed) render();
+  }
+  function subscribeRemote() {
+    COLLECTIONS.forEach(c => {
+      db.collection(c).onSnapshot(snap => {
+        let changed = false;
+        snap.docChanges().forEach(ch => {
+          const path = docPath(c, ch.doc.id);
+          if (pending.has(path)) return;                                     // our own unsynced change is newer
+          if (ch.type === 'removed') { if (records().has(path)) changed = removeLocal(path) || changed; return; }
+          const r = ch.doc.data(); const l = records().get(path);
+          if (r && ts(r) > (l ? ts(l) : -1)) changed = applyRemote(path, clone(r)) || changed;
+        });
+        if (changed) { persistLocal(); render(); }
+      }, (e) => { if (e && e.code === 'revoked') { db = null; setDbState('off'); } });
+    });
   }
 
   /* ---------- dates ---------- */
@@ -69,6 +222,9 @@
   function bottomReps(reps) { const m = String(reps).match(/(\d+)/); return m ? Number(m[1]) : null; }
   function restLabel(sec) { return sec % 60 === 0 ? (sec / 60) + ' min' : sec < 120 ? sec + ' s' : (sec / 60).toFixed(1) + ' min'; }
   function isTimed(reps) { return /min|\ss$|s\b/.test(String(reps)); }
+
+  function hasLoggedSets(sess) { return !!(sess && sess.sets && Object.keys(sess.sets).some(ex => sess.sets[ex].some(x => (x.w !== '' && x.w != null) || (x.r !== '' && x.r != null) || x.done))); }
+  function workoutName(sess) { const sp = SPLITS[sess.splitId]; const w = sp && sp.workouts[sess.workoutId]; return w ? w.name : (sess.workoutId || 'Session'); }
 
   /* previous performance of an exercise before a date */
   function lastPerformance(exId, beforeDate) {
@@ -152,6 +308,7 @@
   function render() {
     const n = dayIndex(todayStr());
     $('#daypill').textContent = n < 1 ? `Starts in ${1 - n} d` : n > TOTAL_DAYS ? `Day ${n} · beyond 100` : `Day ${n} / ${TOTAL_DAYS}`;
+    renderSyncState();
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
     document.querySelectorAll('.view').forEach(v => v.hidden = v.id !== 'view-' + activeTab);
     ({ today: renderToday, plan: renderPlan, progress: renderProgress, nutrition: renderNutrition, guide: renderGuide, settings: renderSettings })[activeTab]();
@@ -210,9 +367,12 @@
       state.body = state.body.filter(b => b.date !== viewDate); state.body.push({ date: viewDate, kg, waist }); save(true); toast('Saved'); render();
     };
 
+    // morning timeline
+    root.appendChild(morningCard(n));
+
     // habits
     const hb = state.habits[viewDate] || {};
-    const habits = [['protein', 'Protein hit', nutrition(n).protein + ' g'], ['steps', 'Steps', '8–10k'], ['sleep', 'Sleep', '7–9 h'], ['creatine', 'Creatine', '5 g']];
+    const habits = [['protein', 'Protein hit', nutrition(n).protein + ' g'], ['steps', 'Steps', '8–10k (gym walk ≈ 3k)'], ['sleep', 'Sleep', '7–9 h'], ['creatine', 'Creatine', '5 g']];
     const hcard = el(`<section class="card"><h3>Daily non-negotiables</h3><div class="habits"></div></section>`);
     habits.forEach(([k, label, sub]) => {
       const h = el(`<button class="habit ${hb[k] ? 'on' : ''}" type="button"><input type="checkbox" ${hb[k] ? 'checked' : ''} tabindex="-1"><span><b>${label}</b><small>${sub}</small></span></button>`);
@@ -239,25 +399,33 @@
     root.appendChild(sel);
     $('#wsel').onchange = (e) => {
       const id = e.target.value || null;
-      if (!id) { if (sess && !sess.done) delete state.sessions[viewDate]; else if (sess) { sess.workoutId = null; } }
-      else { state.sessions[viewDate] = Object.assign({ workoutId: id, splitId: spId, sets: {}, done: false, notes: '' }, state.sessions[viewDate] || {}, { workoutId: id, splitId: spId }); }
+      const cur = state.sessions[viewDate];
+      if (!id) {
+        if (cur && hasLoggedSets(cur)) { toast('This day has logged sets. Delete them first.'); e.target.value = cur.workoutId || ''; return; }
+        if (cur) delete state.sessions[viewDate];
+      } else {
+        state.sessions[viewDate] = Object.assign({ workoutId: id, splitId: spId, sets: {}, done: false, notes: '' }, cur || {}, { workoutId: id, splitId: spId });
+      }
       save(true); renderToday();
     };
 
     if (!chosenId) return;
     const wk = sp.workouts[chosenId];
+    // Nothing is written to storage until you type or tick something: viewing a day never creates a record.
     const s = state.sessions[viewDate] || { workoutId: chosenId, splitId: spId, sets: {}, done: false, notes: '' };
-    state.sessions[viewDate] = s;
+    const commit = () => { if (state.sessions[viewDate] !== s) state.sessions[viewDate] = s; save(); };
 
     const wcardEl = el(`<section class="card"><div class="row between"><div><div class="eyebrow">${esc(wk.focus)}</div><h2>${esc(wk.name)}</h2></div>${ph && ph.setMod === 'deload' ? '<span class="chip warn">Deload: 2 sets, −20% load</span>' : ''}</div>
-      <p class="muted small">Warm-up first: 5 min easy cardio, then light ramp sets on the first lift. Rest times are per set. Tap ⏱ to start the rest timer.</p></section>`);
+      <p class="muted small">Your walk in was the general warm-up. Do 2–3 min of mobility, then ramp sets on the first lift (one extra on lower days). Rest times are per set. Tap ⏱ to start the rest timer.</p></section>`);
     root.appendChild(wcardEl);
 
     wk.items.forEach((item, idx) => {
       const ex = EXERCISES[item.ex];
       const p = prescribe(item, ph);
-      const rows = s.sets[item.ex] = s.sets[item.ex] || [];
+      const stored = s.sets[item.ex] || [];
+      const rows = stored.slice();
       while (rows.length < p.sets) rows.push({ w: '', r: '', done: false });
+      const own = (i) => { const arr = s.sets[item.ex] = s.sets[item.ex] || []; while (arr.length <= i) arr.push(rows[arr.length]); };
       const lp = lastPerformance(item.ex, viewDate);
       const sug = suggestion(item.ex, item, viewDate);
       const timed = isTimed(item.reps) || item.cardio;
@@ -281,12 +449,12 @@
       rows.forEach((row, i) => {
         const r = el(`<div class="setrow ${row.done ? 'done' : ''}"><span class="idx">${i + 1}</span><input type="number" step="0.5" inputmode="decimal" value="${esc(row.w)}" placeholder="${lp && lp.sets[i] ? esc(lp.sets[i].w) : ''}" aria-label="weight set ${i + 1}"><input type="number" step="1" inputmode="numeric" value="${esc(row.r)}" placeholder="${lp && lp.sets[i] ? esc(lp.sets[i].r) : ''}" aria-label="reps set ${i + 1}"><input type="checkbox" ${row.done ? 'checked' : ''} aria-label="set ${i + 1} done"></div>`);
         const [wIn, rIn, cIn] = r.querySelectorAll('input');
-        wIn.oninput = () => { row.w = wIn.value; save(); };
-        rIn.oninput = () => { row.r = rIn.value; save(); };
+        wIn.oninput = () => { own(i); row.w = wIn.value; commit(); };
+        rIn.oninput = () => { own(i); row.r = rIn.value; commit(); };
         cIn.onchange = () => {
-          row.done = cIn.checked;
+          own(i); row.done = cIn.checked;
           if (row.done) { if (!row.w && wIn.placeholder) { row.w = wIn.placeholder; wIn.value = row.w; } if (!row.r && rIn.placeholder) { row.r = rIn.placeholder; rIn.value = row.r; } if (item.rest) startRest(item.rest); }
-          r.classList.toggle('done', row.done); save();
+          r.classList.toggle('done', row.done); commit();
         };
         setsEl.appendChild(r);
       });
@@ -300,8 +468,33 @@
         <button class="btn ${s.done ? '' : 'primary'} block" id="finish">${s.done ? 'Mark as not finished' : 'Finish workout'}</button>
       </section>`);
     root.appendChild(foot);
-    $('#notes').oninput = (e) => { s.notes = e.target.value; save(); };
-    $('#finish').onclick = () => { s.done = !s.done; s.finishedAt = s.done ? new Date().toISOString() : null; save(true); toast(s.done ? 'Workout logged. Eat.' : 'Reopened'); renderToday(); };
+    $('#notes').oninput = (e) => { s.notes = e.target.value; commit(); };
+    $('#finish').onclick = () => { s.done = !s.done; s.finishedAt = s.done ? new Date().toISOString() : null; if (state.sessions[viewDate] !== s) state.sessions[viewDate] = s; save(true); toast(s.done ? 'Workout logged. Eat.' : 'Reopened'); renderToday(); };
+  }
+
+  /* morning timeline from wake time */
+  function addMin(hhmm, m) { const [h, mi] = hhmm.split(':').map(Number); const t = (h * 60 + mi + m + 1440) % 1440; return `${pad(Math.floor(t / 60))}:${pad(t % 60)}`; }
+  function morningCard(n) {
+    const wake = state.settings.wakeTime || '05:00';
+    const walk = Number(state.settings.walkToGymMin) || 12;
+    const training = n >= 1 && plannedWorkoutId(n);
+    const bed = addMin(wake, -(7.75 * 60));
+    const rows = training ? [
+      [wake, 'Wake, toilet, weigh in before anything else. Log it above.'],
+      [addMin(wake, 10), 'Pre-gym snack: banana + whey, or yoghurt + honey. Coffee. 500 ml water.'],
+      [addMin(wake, 45), `Walk to the gym (${walk} min, ~1,500 steps). Brisk: this is the warm-up.`],
+      [addMin(wake, 45 + walk), '2–3 min mobility, ramp sets, then the session (50–60 min).'],
+      [addMin(wake, 45 + walk + 60), 'Walk home. On lower days: the 20-min incline walk here, or the 30-min route home.'],
+      [addMin(wake, 45 + walk + 60 + walk + 15), 'Breakfast: 40–50 g protein, the biggest meal of the day.'],
+    ] : [
+      [wake, 'Wake, weigh in before anything else. Rest days are for sleeping 30 min longer if you can.'],
+      [addMin(wake, 30), 'Breakfast with 40–50 g protein.'],
+      ['Any time', 'Steps to 8–10k. A 30-min walk outside is the whole cardio requirement today.'],
+    ];
+    const c = el(`<section class="card"><div class="row between"><h3>Morning routine</h3><span class="chip warn">Lights out by ${bed}</span></div>
+      <div class="tablewrap"><table class="plain"><tbody>${rows.map(r => `<tr><td class="num" style="white-space:nowrap;width:70px"><b>${esc(r[0])}</b></td><td class="small">${esc(r[1])}</td></tr>`).join('')}</tbody></table></div>
+      <p class="muted small">Built from your wake time (${wake}). Change it in Settings. 7.75 h of sleep is the floor that keeps the plan alive.</p></section>`);
+    return c;
   }
 
   /* rest timer */
@@ -475,6 +668,18 @@
     if (list.length) { const tb = $('tbody', pc); list.forEach(ex => tb.appendChild(el(`<tr><td>${esc(EXERCISES[ex] ? EXERCISES[ex].name : ex)}</td><td class="r num">${prs[ex].w} × ${prs[ex].r}</td><td class="r num">${prs[ex].e1.toFixed(1)}</td><td class="small">${human(prs[ex].date)}</td></tr>`))); }
     root.appendChild(pc);
 
+    // workout history: every logged session, newest first
+    const hist = Object.keys(state.sessions).filter(d => state.sessions[d] && (state.sessions[d].done || hasLoggedSets(state.sessions[d]))).sort().reverse();
+    const hc = el(`<section class="card"><div class="row between"><h3>Workout history</h3><span class="chip">${hist.length} logged</span></div>${hist.length ? '<div class="stack" id="hist"></div>' : '<p class="muted small">Every session you log appears here with its weights and reps. Nothing yet.</p>'}</section>`);
+    hist.forEach(d => {
+      const ss = state.sessions[d];
+      const lines = Object.keys(ss.sets || {}).map(ex => { const done = ss.sets[ex].filter(x => x.w !== '' || x.r !== ''); return done.length ? `<li><b>${esc(EXERCISES[ex] ? EXERCISES[ex].name : ex)}</b> <span class="num">${done.map(x => `${x.w || '–'}×${x.r || '–'}`).join(', ')}</span></li>` : ''; }).join('');
+      const item = el(`<div class="exercise" style="padding-top:10px"><div class="row between"><div><div class="eyebrow">${human(d)} · Day ${dayIndex(d)}</div><b>${esc(workoutName(ss))}</b></div><span class="chip ${ss.done ? 'good' : 'warn'}">${ss.done ? 'Finished' : 'Not finished'}</span></div>${lines ? `<ul class="small" style="margin:6px 0 0;padding-left:18px">${lines}</ul>` : ''}${ss.notes ? `<p class="small muted" style="margin-top:4px">${esc(ss.notes)}</p>` : ''}<button class="btn sm" style="margin-top:8px" data-open="${d}">Open day</button></div>`);
+      $('[data-open]', item).onclick = () => { viewDate = d; activeTab = 'today'; render(); window.scrollTo(0, 0); };
+      $('#hist', hc).appendChild(item);
+    });
+    root.appendChild(hc);
+
     // measurements reminder
     root.appendChild(el(`<section class="card"><h3>Measure on Day 1, 50 and 100</h3><p class="small muted">Cold flexed upper arm, chest at nipple line, waist at navel, same tape, morning. Take front, side and back photos in the same light. Progress you cannot see week to week becomes obvious over 50 days.</p></section>`));
   }
@@ -565,6 +770,7 @@
     const root = $('#view-guide'); root.innerHTML = '';
     root.appendChild(el(`<section class="card"><h1>How to train</h1><p class="muted small">Read once in week 1, then come back when something stalls.</p></section>`));
     root.appendChild(el(`<section class="card guide"><h2>Warm-up (10 minutes, every session)</h2><ol>${GUIDE.warmup.map(t => `<li>${esc(t)}</li>`).join('')}</ol></section>`));
+    root.appendChild(el(`<section class="card guide"><h2>Training at 6 AM</h2><ul>${GUIDE.morning.map(t => `<li>${esc(t)}</li>`).join('')}</ul></section>`));
     root.appendChild(el(`<section class="card guide"><h2>Progression: how the weights go up</h2><ul>${GUIDE.progression.map(t => `<li>${esc(t)}</li>`).join('')}</ul></section>`));
     root.appendChild(el(`<section class="card guide"><h2>RPE and reps in reserve</h2><ul>${GUIDE.rpe.map(t => `<li>${esc(t)}</li>`).join('')}</ul></section>`));
     root.appendChild(el(`<section class="card guide"><h2>${esc(GUIDE.chest.title)}</h2>${GUIDE.chest.body.map(t => `<p>${esc(t)}</p>`).join('')}</section>`));
@@ -599,6 +805,8 @@
           <option value="1.5" ${s.activity == 1.5 ? 'selected' : ''}>1.5 · 4–5 gym days + 8–10k steps</option>
           <option value="1.6" ${s.activity == 1.6 ? 'selected' : ''}>1.6 · on your feet all day + gym</option>
           <option value="1.75" ${s.activity == 1.75 ? 'selected' : ''}>1.75 · physical job + gym</option></select></label>
+        <label class="field">Wake time on gym days<input type="text" id="sWake" value="${esc(s.wakeTime || '05:00')}" placeholder="05:00" pattern="[0-2][0-9]:[0-5][0-9]"></label>
+        <label class="field">Walk to gym (minutes, one way)<input type="number" id="sWalk" value="${esc(s.walkToGymMin || 12)}"></label>
         <label class="field">Split<select id="sSplit"><option value="">Follow the 100-day plan</option>${Object.keys(SPLITS).map(k => `<option value="${k}" ${s.splitOverride === k ? 'selected' : ''}>${esc(SPLITS[k].name)}</option>`).join('')}</select></label>
       </div>
       <button class="btn primary" id="sSave">Save settings</button></section>`);
@@ -606,8 +814,21 @@
     $('#sSave').onclick = () => {
       s.startDate = $('#sStart').value || s.startDate; s.heightCm = Number($('#sH').value) || s.heightCm; s.age = Number($('#sA').value) || s.age;
       s.startWeightKg = Number($('#sW').value) || s.startWeightKg; s.goalKg = Number($('#sG').value) || s.goalKg; s.activity = Number($('#sAct').value) || s.activity;
+      const wt = $('#sWake').value.trim(); if (/^\d{1,2}:\d{2}$/.test(wt)) s.wakeTime = wt.padStart(5, '0');
+      s.walkToGymMin = Number($('#sWalk').value) || s.walkToGymMin;
       s.splitOverride = $('#sSplit').value || null; save(true); toast('Saved'); render();
     };
+
+    const sy = el(`<section class="card"><h3>Where your data is</h3>
+      <p class="small" id="syncdetail"></p>
+      <div class="row"><button class="btn sm" id="syncNow" ${db ? '' : 'disabled'}>Sync now</button><span class="chip" id="syncchip"></span></div>
+      <p class="muted small">Inside claude.ai this page saves every change to your account's database as well as the device, so the same logs show on phone and laptop. Opened as a plain file or from GitHub Pages it saves on the device only.</p></section>`);
+    root.appendChild(sy);
+    const counts = `${Object.keys(state.sessions).length} sessions · ${state.body.length} weigh-ins · ${Object.keys(state.habits).length} habit days`;
+    $('#syncdetail', sy).textContent = counts;
+    $('#syncchip', sy).textContent = dbState === 'off' ? 'Device only' : dbState === 'synced' ? 'Synced' : dbState === 'error' ? 'Sync retrying' : 'Syncing…';
+    $('#syncchip', sy).className = 'chip ' + (dbState === 'synced' ? 'good' : dbState === 'error' ? 'warn' : '');
+    $('#syncNow', sy).onclick = () => { save(true); toast('Syncing'); };
 
     const io = el(`<section class="card"><h3>Backup and restore</h3>
       <p class="muted small">Your data lives only in this browser. Copy the backup text somewhere safe once a week (notes app, email to yourself). Paste it back here on a new phone.</p>
@@ -621,7 +842,16 @@
       if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(ta.value).then(() => toast('Copied'), fallback); else fallback();
     };
     $('#ioImport').onclick = () => {
-      try { const obj = JSON.parse($('#ioText').value); if (!obj || !obj.settings) throw new Error('bad'); state = Object.assign({ sessions: {}, body: [], habits: {} }, obj); state.settings = Object.assign({}, DEFAULT_SETTINGS, obj.settings); save(true); toast('Restored'); render(); }
+      try {
+        const obj = JSON.parse($('#ioText').value); if (!obj || !obj.settings) throw new Error('bad');
+        const incoming = Object.assign({ sessions: {}, body: [], habits: {} }, obj); incoming.settings = Object.assign({}, DEFAULT_SETTINGS, obj.settings);
+        // merge instead of replace: a backup never erases newer logs on this device
+        Object.keys(incoming.sessions).forEach(d => { if (!state.sessions[d] || ts(incoming.sessions[d]) >= ts(state.sessions[d])) state.sessions[d] = incoming.sessions[d]; });
+        Object.keys(incoming.habits).forEach(d => { if (!state.habits[d] || ts(incoming.habits[d]) >= ts(state.habits[d])) state.habits[d] = incoming.habits[d]; });
+        incoming.body.forEach(b => { const cur = state.body.find(x => x.date === b.date); if (!cur || ts(b) >= ts(cur)) { state.body = state.body.filter(x => x.date !== b.date); state.body.push(b); } });
+        if (ts(incoming.settings) >= ts(state.settings)) state.settings = incoming.settings;
+        save(true); toast('Restored and merged'); render();
+      }
       catch (e) { toast('That text is not a valid backup'); }
     };
 
@@ -640,4 +870,5 @@
   document.querySelectorAll('.tab').forEach(t => t.onclick = () => { activeTab = t.dataset.tab; render(); window.scrollTo(0, 0); });
   try { const h = location.hash.replace('#', ''); if (['today', 'plan', 'progress', 'nutrition', 'guide', 'settings'].includes(h)) activeTab = h; } catch (e) {}
   render();
+  connectDb();
 })();

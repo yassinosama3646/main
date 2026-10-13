@@ -1,6 +1,8 @@
 # Rebuild 100
 
-A self-contained gym app for a 100-day recomposition challenge. No build step, no account, no server: open `index.html` on your phone, add it to the home screen, and it works offline after the first load. All data stays in the browser (use Settings → Backup weekly).
+A self-contained gym app for a 100-day recomposition challenge. No build step, no server: open `index.html` on your phone, add it to the home screen, and it works offline after the first load.
+
+**Where your data lives.** Every change is written to the device immediately. Inside claude.ai (the published artifact) it is also written to the artifact's own database, so the same logs appear on phone and laptop and survive the viewer clearing browser storage. Opened as a plain file or from GitHub Pages it is device-only: use Settings → Backup weekly. The status line under the header always says which mode you are in.
 
 **Start:** Tuesday 13 Oct 2026 (Day 1) · **End:** Wednesday 20 Jan 2027 (Day 100)
 
@@ -25,10 +27,10 @@ A self-contained gym app for a 100-day recomposition challenge. No build step, n
 |---|---|
 | **Today** | Morning weigh-in and waist, four daily habits, the planned workout with sets × reps, rest timer, last session beside every exercise, and an automatic "add 2.5 kg / hold / drop" suggestion. Log past days you forgot via Prev/Next. |
 | **Plan** | 100-day calendar (done / missed / planned / deload / rest), the four phases with their rules, and all five splits with a "use this split" override. |
-| **Progress** | Body-weight chart with 7-day average, weekly averages against the phase's target rate, estimated 1RM personal bests. |
+| **Progress** | Body-weight chart with 7-day average, weekly averages against the phase's target rate, estimated 1RM personal bests, and the full workout history with every logged set. |
 | **Food** | Calories and macros for the current phase, recalculated from your latest weight, plus a calorie adjustment suggestion driven by your weekly trend. |
 | **Guide** | Warm-up, progression rules, RPE, the chest and biceps strategy, fat-loss playbook, exercise library with cues and substitutions. |
-| **Settings** | Start date, profile, split override, backup / restore, reset. |
+| **Settings** | Start date, wake time, walk length, profile, split override, sync status, backup / restore, reset. |
 
 ## The plan
 
@@ -47,9 +49,24 @@ Studies that equate weekly sets find little difference between splits; what show
 
 Weekly pattern for the U/L block (Day 1 = Tuesday): **Tue** Upper A · **Wed** Lower A · **Thu** rest · **Fri** Upper B · **Sat** Lower B · **Sun / Mon** rest. Rest days: 8–10k steps, optional 20–30 min incline walk.
 
+### The 6 AM routine
+
+Training is about an hour after waking. The walk to the gym (about 1,500 steps, 12 minutes each way) is the general warm-up and the walk home is the cool-down; it covers roughly 3,000 of the daily step target, not all of it. The app builds this timeline from the wake time in Settings:
+
+| Time | What |
+|---|---|
+| 05:00 | Wake, toilet, weigh in before anything else |
+| 05:10 | Small pre-gym snack: banana + whey, or yoghurt + honey. Coffee. 500 ml water |
+| 05:45 | Walk to the gym, brisk |
+| 05:57 | 2–3 min mobility, ramp sets (one extra on lower days), then the session |
+| ~07:00 | Walk home. On lower days: the 20-min incline walk, or the 30-min route home |
+| ~07:30 | Breakfast, 40–50 g protein, the biggest meal of the day |
+
+Sleep is the constraint: a 05:00 alarm means lights out by 21:00–21:30. If that is impossible on some nights, wake at 6 and train at 7; one hour between waking and lifting is enough.
+
 ### Day 1 — Upper A (Tuesday 13 Oct 2026)
 
-Warm-up: 5 min incline walk, band pull-aparts ×15, arm circles, then on the incline press: light ×12, 50 % ×8, 75 % ×4.
+Warm-up: the walk in, then inside the gym 2–3 min of band pull-aparts ×15, arm circles, bodyweight squats ×10, hip hinges ×10; on the incline press: light ×12, 50 % ×8, 75 % ×4.
 
 Phase 1 means **2 working sets** per exercise and stopping with 3–4 reps in reserve. The job today is to find your working weights and write them in the app, not to set records.
 
@@ -99,7 +116,7 @@ With muscle memory, roughly +3–4 kg lean mass and −2–3 kg fat is a strong 
 index.html     page shell and tab bar
 css/app.css    styles, light and dark themes
 js/data.js     exercise library, splits, phases, guide text, sample meals
-js/app.js      scheduling, logging, progression, chart, nutrition maths, backup
+js/app.js      scheduling, logging, progression, chart, nutrition maths, storage sync, backup
 ```
 
 This is a training and nutrition plan for a healthy 21-year-old, not medical advice.

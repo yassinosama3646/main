@@ -13,6 +13,8 @@ R100.DEFAULT_SETTINGS = {
   goalKg: 83,
   activity: 1.5,          // 4–5 lifting days + 8–10k steps
   splitOverride: null,    // null = follow the 100-day plan
+  wakeTime: '05:00',      // training is ~1 h after waking; the morning timeline builds from this
+  walkToGymMin: 12,       // ~1,500 steps each way
 };
 
 /* ---------- Exercise library ---------- */
@@ -94,7 +96,7 @@ R100.SPLITS = {
         X('leg_curl', 2, '12–15', 75),
         X('calf_stand', 3, '12–15', 60),
         X('hanging_knee_raise', 3, '12–15', 60),
-        X('incline_walk', 1, '20 min', 0, { cardio: true, note: 'Optional but recommended for fat loss.' }),
+        X('incline_walk', 1, '20 min', 0, { cardio: true, note: 'Optional: do it here, or take a 30-minute route home instead of the 12-minute one.' }),
       ]},
       ub: { name: 'Upper B — Back & arms', focus: 'Lats, side delts, biceps, triceps', items: [
         X('pullup', 3, '6–10', 150, { note: 'Assisted is fine. Goal: 3×10 unassisted by Day 100.' }),
@@ -115,7 +117,7 @@ R100.SPLITS = {
         X('calf_seated', 3, '15–20', 60),
         X('plank', 3, '30–60 s', 60),
         X('bayesian_curl', 2, '12–15', 60, { priority: true, note: 'Third biceps exposure of the week. Light, slow.' }),
-        X('incline_walk', 1, '20 min', 0, { cardio: true }),
+        X('incline_walk', 1, '20 min', 0, { cardio: true, note: 'Optional: or the long route home.' }),
       ]},
     },
   },
@@ -241,10 +243,18 @@ R100.TOTAL_DAYS = 100;
 /* ---------- Guide content ---------- */
 R100.GUIDE = {
   warmup: [
-    '5 minutes incline walk or bike: raise body temperature, nothing more.',
-    'Arm circles, band pull-aparts ×15, bodyweight squats ×10, hip hinges ×10.',
-    'First compound lift of the day: empty or very light ×12, 50% of work weight ×8, 75% ×4, then work sets.',
+    'Your walk to the gym (about 1,500 steps, 12 minutes) is the general warm-up. Walk briskly enough to arrive warm, not strolling.',
+    'Early-morning joints and spine are stiffer than afternoon ones: 2–3 minutes inside the gym before touching a weight. Arm circles, band pull-aparts ×15, bodyweight squats ×10, hip hinges ×10, cat-cow ×8.',
+    'First compound lift of the day: empty or very light ×12, 50% of work weight ×8, 75% ×4, then work sets. On lower days add one more ramp set before squats and RDLs because the lower back is least ready first thing.',
     'Later exercises need one light set of 8–10 at most.',
+    'The walk home is the cool-down. On lower days the optional 20-minute incline walk is still the fat-loss tool: do it in the gym or take a 30-minute route home instead.',
+  ],
+  morning: [
+    'Sleep is the constraint, not the alarm. Waking at 5 means lights out by 21:00–21:30 for 7.5–8 hours. Train at 6 after a midnight bedtime and you will lose the plan by week 3. If 21:30 is impossible on some nights, train at 7 and wake at 6: one hour between waking and lifting is enough.',
+    'Weigh in straight after the toilet, before any food or drink. That is the only reading that is comparable day to day.',
+    'Eat something small 30–45 minutes before lifting: fast carbs plus some protein. A banana and a scoop of whey in water, or 200 g Greek yoghurt with honey. Training heavy fully fasted costs reps; training on a full breakfast costs comfort. Coffee is fine and helps.',
+    'Breakfast proper within an hour of getting home. This is the biggest meal of the day and carries 40–50 g of protein.',
+    'Lay out clothes, shoes, headphones and the pre-workout snack the night before. Decisions at 5 AM are where mornings die.',
   ],
   progression: [
     'Double progression: each exercise has a rep range (say 8–10). Keep the same weight until you hit the top number on every set with the phase’s reps in reserve.',
@@ -298,9 +308,9 @@ R100.GUIDE = {
 
 /* ---------- Sample day of eating (edit freely) ---------- */
 R100.MEALS = [
-  { when: 'Breakfast', food: '4 whole eggs + 150 g egg whites, 80 g oats with milk, 1 banana', p: 45, kcal: 700 },
+  { when: 'Pre-gym (30–45 min before)', food: '1 banana + 1 scoop whey in water, black coffee, 500 ml water', p: 25, kcal: 220 },
+  { when: 'Breakfast (after the walk home)', food: '4 whole eggs + 150 g egg whites, 80 g oats with milk, berries', p: 50, kcal: 750 },
   { when: 'Lunch', food: '200 g chicken breast (cooked), 250 g cooked rice, vegetables, 1 tbsp olive oil', p: 60, kcal: 800 },
-  { when: 'Pre-workout', food: '250 g Greek yoghurt (0–2%), 1 apple, honey', p: 25, kcal: 350 },
-  { when: 'Post-workout', food: '1 scoop whey in water, 1 rice cake or fruit', p: 25, kcal: 200 },
-  { when: 'Dinner', food: '180 g lean beef or fish, potatoes or pasta, salad', p: 45, kcal: 650 },
+  { when: 'Afternoon', food: '250 g Greek yoghurt (0–2%), 1 apple, handful of nuts', p: 25, kcal: 400 },
+  { when: 'Dinner (by 19:30)', food: '180 g lean beef or fish, potatoes or pasta, salad', p: 45, kcal: 650 },
 ];
