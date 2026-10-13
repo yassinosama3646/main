@@ -8,33 +8,48 @@
      Source of truth while the page runs: `state` (in memory).
      Durable copies: localStorage (always, instant) and the artifact's `db` capability
      (when the claude.ai viewer grants it: survives reloads, devices and republishes).
-     Every record carries `updatedAt`; newer wins on merge. Unsynced changes are kept
-     in a pending queue that is itself persisted, so a killed tab loses nothing. */
-  const PENDING_KEY = KEY + '.pending';
+     Records: sessions/<date>, body/<date>, habits/<date>, settings/main, meta/reset.
+     Rules that protect data:
+       - nothing is written to the account until the first download (merge) succeeded;
+       - sessions merge per exercise and per set (union), never whole-record replace;
+       - deletes carry a timestamp and lose to a newer remote write;
+       - a reset writes a tombstone so stale devices do not resurrect old logs;
+       - unsynced changes live in a persisted queue, so a killed tab loses nothing. */
+  const PENDING_KEY = KEY + '.pending', FAILED_KEY = KEY + '.failed', SYNCED_KEY = KEY + '.synced';
+  const LEGACY_TS = 1;                  // stamp for records that predate timestamps
+  const isObj = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
+  const DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
   let state = load();
-  let pending = loadPending();          // path -> body | null (delete), awaiting a db write
+  let pending = loadMap(PENDING_KEY);   // path -> body | {__del:true, at}
+  let failed = loadMap(FAILED_KEY);     // path -> error code (permanent write failures)
+  let lastSynced = loadMap(SYNCED_KEY); // path -> signature of the last body both sides agreed on (3-way merge base)
   let baseline = new Map();             // path -> signature of the last persisted body
-  let db = null, dbState = 'off', dbErr = null, flushing = false, flushT = null, failures = 0;
+  let dbNs = null, db = null;           // dbNs: namespace once granted; db: same, but only after the first merge succeeded
+  let dbState = 'off', dbErr = null, flushing = false, flushT = null, failures = 0, mergeAttempt = 0, mergeT = null, unsubs = [];
+  let dirty = false, renderQueued = false;
+  const inflight = new Set();           // paths whose write is on the wire: snapshots about them are stale by definition
   let viewDate = todayStr();
   let activeTab = 'today';
   let restTimer = null;
-  const COLLECTIONS = ['sessions', 'body', 'habits', 'settings'];
+  const COLLECTIONS = ['sessions', 'body', 'habits', 'settings', 'meta'];
 
-  function load() {
-    let s = null;
-    try { s = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { s = null; }
-    s = s || {};
-    s.settings = Object.assign({}, DEFAULT_SETTINGS, s.settings || {});
-    s.sessions = s.sessions || {};
-    s.body = Array.isArray(s.body) ? s.body : [];
-    s.habits = s.habits || {};
-    return s;
+  function sanitize(raw) {
+    const s = isObj(raw) ? raw : {};
+    const out = {};
+    out.settings = Object.assign({}, DEFAULT_SETTINGS, isObj(s.settings) ? s.settings : {});
+    out.sessions = {}; if (isObj(s.sessions)) Object.keys(s.sessions).forEach(d => { const v = s.sessions[d]; if (DATE_RE.test(d) && isObj(v)) { v.sets = isObj(v.sets) ? v.sets : {}; Object.keys(v.sets).forEach(ex => { if (!Array.isArray(v.sets[ex])) delete v.sets[ex]; else v.sets[ex] = v.sets[ex].filter(isObj); }); out.sessions[d] = v; } });
+    out.body = Array.isArray(s.body) ? s.body.filter(b => isObj(b) && DATE_RE.test(b.date) && isFinite(Number(b.kg))) : [];
+    out.habits = {}; if (isObj(s.habits)) Object.keys(s.habits).forEach(d => { if (DATE_RE.test(d) && isObj(s.habits[d])) out.habits[d] = s.habits[d]; });
+    out.resetAt = typeof s.resetAt === 'number' ? s.resetAt : 0;
+    return out;
   }
-  function loadPending() {
-    try { const a = JSON.parse(localStorage.getItem(PENDING_KEY) || '[]'); return new Map(Array.isArray(a) ? a : []); } catch (e) { return new Map(); }
-  }
+  function load() { let raw = null; try { raw = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { raw = null; } return sanitize(raw); }
+  function loadMap(key) { try { const a = JSON.parse(localStorage.getItem(key) || '[]'); return new Map(Array.isArray(a) ? a.filter(e => Array.isArray(e) && typeof e[0] === 'string').map(e => [e[0], e[1] === null ? { __del: true, at: 0 } : e[1]]) : []); } catch (e) { return new Map(); } }
   const clone = (o) => JSON.parse(JSON.stringify(o));
   const sig = (body) => JSON.stringify(body, (k, v) => k === 'updatedAt' ? undefined : v);
+  const DEFAULT_SIG = sig(DEFAULT_SETTINGS);
+  const ts = (b) => (b && typeof b.updatedAt === 'number') ? b.updatedAt : 0;
+  const isDel = (v) => !!(v && v.__del);
 
   /* Flattened view: db path -> the live state object that is the document body. */
   function records() {
@@ -43,6 +58,7 @@
     state.body.forEach(b => { if (b && b.date) m.set('body/' + b.date, b); });
     Object.keys(state.habits).forEach(d => { if (state.habits[d]) m.set('habits/' + d, state.habits[d]); });
     m.set('settings/main', state.settings);
+    if (state.resetAt) m.set('meta/reset', { at: state.resetAt, updatedAt: state.resetAt });
     return m;
   }
   function rebuildBaseline() { baseline = new Map(); records().forEach((b, p) => baseline.set(p, sig(b))); }
@@ -54,37 +70,142 @@
     const live = records();
     live.forEach((body, path) => {
       const sg = sig(body);
-      if (baseline.get(path) !== sg) { body.updatedAt = now; baseline.set(path, sg); pending.set(path, clone(body)); }
+      if (baseline.get(path) !== sg) { body.updatedAt = now; baseline.set(path, sg); pending.set(path, clone(body)); failed.delete(path); dirty = true; }
     });
-    Array.from(baseline.keys()).forEach(path => { if (!live.has(path)) { baseline.delete(path); pending.set(path, null); } });
+    Array.from(baseline.keys()).forEach(path => { if (!live.has(path)) { baseline.delete(path); pending.set(path, { __del: true, at: now }); dirty = true; } });
   }
-  function persistLocal() {
+  function persistLocal(force) {
+    if (!dirty && !force) return;                                   // a tab that changed nothing never overwrites another tab's work
     try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
     try { localStorage.setItem(PENDING_KEY, JSON.stringify(Array.from(pending.entries()))); } catch (e) { /* storage unavailable */ }
+    try { localStorage.setItem(FAILED_KEY, JSON.stringify(Array.from(failed.entries()))); } catch (e) { /* storage unavailable */ }
+    try { localStorage.setItem(SYNCED_KEY, JSON.stringify(Array.from(lastSynced.entries()))); } catch (e) { /* storage unavailable */ }
   }
+  function baseOf(path) { const sg = lastSynced.get(path); if (!sg) return null; try { return JSON.parse(sg); } catch (e) { return null; } }
   let saveT = null;
+  function flushLocalNow() { clearTimeout(saveT); saveT = null; const before = pending.size; diffAndQueue(); persistLocal(); if (pending.size !== before) scheduleFlush(0); }
   function save(now) {
     clearTimeout(saveT);
-    const run = () => { diffAndQueue(); persistLocal(); scheduleFlush(0); };
+    const run = () => { saveT = null; diffAndQueue(); persistLocal(); scheduleFlush(0); };
     if (now) run(); else saveT = setTimeout(run, 250);
   }
   window.addEventListener('pagehide', () => save(true));
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') save(true); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') save(true); else if (dbNs && !db) scheduleMerge(0); else scheduleFlush(0); });
+  /* another tab of this same browser wrote newer data: adopt it */
+  window.addEventListener('storage', (e) => {
+    if (e.key !== KEY || !e.newValue) return;
+    let other = null; try { other = sanitize(JSON.parse(e.newValue)); } catch (x) { return; }
+    const theirs = new Map();
+    Object.keys(other.sessions).forEach(d => theirs.set('sessions/' + d, other.sessions[d]));
+    other.body.forEach(b => theirs.set('body/' + b.date, b));
+    Object.keys(other.habits).forEach(d => theirs.set('habits/' + d, other.habits[d]));
+    theirs.set('settings/main', other.settings);
+    let changed = false;
+    theirs.forEach((r, path) => { const res = reconcile(path, records().get(path), r); if (res.apply) { applyRemote(path, res.body); changed = true; } });
+    if (changed) requestRender();
+  });
+
+  /* ----- merging: union, newer wins on a real conflict, deterministic ----- */
+  function newerFirst(a, b) { const ta = ts(a), tb = ts(b); if (ta !== tb) return ta > tb ? [a, b] : [b, a]; return JSON.stringify(a) >= JSON.stringify(b) ? [a, b] : [b, a]; }
+  const filled = (v) => !(v === '' || v == null);
+  /* Three-way cell merge: n = newer side, o = older side, b = common base (may be undefined).
+     Only one side changed from the base -> that side. Both changed -> prefer a filled value, then the newer side. */
+  const same = (a, b) => String(a == null ? '' : a) === String(b == null ? '' : b);
+  function cell(nv, ov, bv, hasBase) {
+    if (hasBase) { if (same(nv, bv)) return ov; if (same(ov, bv)) return nv; }
+    if (filled(nv)) return nv; if (filled(ov)) return ov; return nv == null ? ov : nv;
+  }
+  function mergeSession(x, y, base) {
+    const [n, o] = newerFirst(x, y);
+    const hb = isObj(base); const bs = (hb && base.sets) || {};
+    const out = {
+      workoutId: cell(n.workoutId, o.workoutId, hb ? base.workoutId : null, hb) || null,
+      splitId: cell(n.splitId, o.splitId, hb ? base.splitId : null, hb) || null,
+      sets: {}, done: false, notes: '', finishedAt: null,
+    };
+    const bd = hb ? !!base.done : false;
+    out.done = hb ? ((!!n.done !== bd) ? !!n.done : !!o.done) : !!(n.done || o.done);
+    out.finishedAt = cell(n.finishedAt, o.finishedAt, hb ? base.finishedAt : null, hb) || null;
+    const exs = new Set([...Object.keys(n.sets || {}), ...Object.keys(o.sets || {})]);
+    exs.forEach(ex => {
+      const a = (n.sets && n.sets[ex]) || [], b = (o.sets && o.sets[ex]) || [], c = bs[ex] || [];
+      const len = Math.max(a.length, b.length); const rows = [];
+      for (let i = 0; i < len; i++) {
+        const ra = a[i] || {}, rb = b[i] || {}, rc = c[i] || {};
+        const hasB = hb && !!c[i];
+        const w = cell(ra.w, rb.w, rc.w, hasB), r = cell(ra.r, rb.r, rc.r, hasB);
+        const done = hasB ? ((!!ra.done !== !!rc.done) ? !!ra.done : !!rb.done) : !!(ra.done || rb.done);
+        rows.push({ w: w == null ? '' : w, r: r == null ? '' : r, done });
+      }
+      out.sets[ex] = rows;
+    });
+    const nn = n.notes || '', on = o.notes || '', bn = hb ? (base.notes || '') : null;
+    if (hb && nn === bn) out.notes = on; else if (hb && on === bn) out.notes = nn;
+    else out.notes = nn.includes(on) ? nn : (on.includes(nn) ? on : (nn + '\n' + on).trim());
+    out.updatedAt = Math.max(ts(n), ts(o));
+    return out;
+  }
+  function mergeFlat(x, y, base) {
+    const [n, o] = newerFirst(x, y); const hb = isObj(base);
+    const out = {}; new Set([...Object.keys(o), ...Object.keys(n)]).forEach(k => { if (k === 'updatedAt') return; out[k] = hb ? cell(n[k], o[k], base[k], Object.prototype.hasOwnProperty.call(base, k) || true) : (n[k] != null ? n[k] : o[k]); });
+    out.updatedAt = Math.max(ts(n), ts(o)); return out;
+  }
+  function mergeSettings(x, y, base) {
+    const xd = sig(x) === DEFAULT_SIG, yd = sig(y) === DEFAULT_SIG;
+    if (xd !== yd) return clone(xd ? y : x);                        // untouched defaults never beat real settings
+    return mergeFlat(x, y, base);
+  }
+  function mergeBodies(col, x, y, base) {
+    if (col === 'sessions') return mergeSession(x, y, base);
+    if (col === 'habits' || col === 'body') return mergeFlat(x, y, base);
+    if (col === 'settings') return mergeSettings(x, y, base);
+    return clone(newerFirst(x, y)[0]);
+  }
+  /* Decide what to do for one path given the local record (l) and the remote one (r).
+     Returns {body, apply, push}: apply = replace local with body, push = write body to the account. */
+  function reconcile(path, l, r) {
+    const col = path.split('/')[0];
+    const pend = pending.get(path);
+    if (isDel(pend)) {
+      if (r && ts(r) > pend.at) { pending.delete(path); return { body: clone(r), apply: true, push: false }; }   // remote wrote after our delete: the delete loses
+      return { body: null, apply: false, push: false };
+    }
+    if (r && !l) {
+      if (state.resetAt && ts(r) < state.resetAt) return { body: null, apply: false, push: false };
+      return { body: clone(r), apply: true, push: false };
+    }
+    if (l && !r) {
+      if (col === 'settings' && sig(l) === DEFAULT_SIG) return { body: null, apply: false, push: false };        // never upload untouched defaults
+      if (state.resetAt && ts(l) < state.resetAt && col !== 'meta' && col !== 'settings') return { body: null, apply: false, push: false, drop: true };
+      return { body: l, apply: false, push: true };
+    }
+    if (!l && !r) return { body: null, apply: false, push: false };
+    if (sig(l) === sig(r)) { lastSynced.set(path, sig(r)); return { body: l, apply: false, push: false }; }
+    const m = mergeBodies(col, l, r, baseOf(path));
+    const changedLocal = sig(m) !== sig(l), changedRemote = sig(m) !== sig(r);
+    if (changedRemote) m.updatedAt = Math.max(ts(l), ts(r), m.updatedAt || 0) + 1;    // so every device sees the merge as newer
+    else m.updatedAt = ts(r);
+    return { body: m, apply: changedLocal || ts(m) !== ts(l), push: changedRemote };
+  }
 
   /* ----- db sync ----- */
   function setDbState(st, err) { dbState = st; dbErr = err || null; renderSyncState(); }
   function renderSyncState() {
-    const elx = document.getElementById('syncstate'); if (!elx) return;
-    const n = pending.size;
+    const n = pending.size, f = failed.size;
     const map = {
       off: 'Saved on this device only · back up weekly in Settings',
-      connecting: 'Connecting to your account…',
+      connecting: 'Saved on device · connecting to your account…',
+      merging: 'Saved on device · downloading your logs…',
       syncing: `Syncing ${n} change${n === 1 ? '' : 's'}…`,
       synced: 'Saved on this device and in your account',
       error: `Saved on device · ${n} change${n === 1 ? '' : 's'} waiting to sync (retrying)`,
     };
-    elx.textContent = map[dbState] || '';
-    elx.dataset.state = dbState;
+    let text = map[dbState] || '';
+    if (f && dbState !== 'off') text += ` · ${f} record${f === 1 ? '' : 's'} could not be saved to your account`;
+    const line = document.getElementById('syncstate'); if (line) { line.textContent = text; line.dataset.state = f && dbState === 'synced' ? 'error' : dbState; }
+    const chip = document.getElementById('syncchip'); if (chip) { chip.textContent = dbState === 'off' ? 'Device only' : dbState === 'synced' ? (f ? 'Synced with errors' : 'Synced') : dbState === 'error' ? 'Sync retrying' : 'Connecting…'; chip.className = 'chip ' + (dbState === 'synced' && !f ? 'good' : dbState === 'error' || f ? 'warn' : ''); }
+    const btn = document.getElementById('syncNow'); if (btn) btn.disabled = !dbNs;
+    const det = document.getElementById('syncdetail'); if (det) det.textContent = `${Object.keys(state.sessions).length} sessions · ${state.body.length} weigh-ins · ${Object.keys(state.habits).length} habit days`;
   }
   function scheduleFlush(ms) { if (!db) return; clearTimeout(flushT); flushT = setTimeout(flush, ms || 0); }
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -94,18 +215,22 @@
     flushing = true; setDbState('syncing');
     try {
       while (pending.size) {
+        if (!db) return;                                              // revoked mid-flight
         const [path, body] = pending.entries().next().value;
-        pending.delete(path);
+        pending.delete(path); inflight.add(path);
         try {
-          if (body === null) await db.doc(path).delete(); else await db.doc(path).set(body);
-          failures = 0; persistLocal(); renderSyncState();
+          if (isDel(body)) { await db.doc(path).delete(); lastSynced.delete(path); } else { await db.doc(path).set(body); lastSynced.set(path, sig(body)); }
+          inflight.delete(path);
+          failures = 0; dirty = true; persistLocal(); renderSyncState();
         } catch (e) {
+          inflight.delete(path);
           const code = e && e.code;
-          if (code === 'invalid_argument' || code === 'transform_error') { failures = 0; persistLocal(); continue; } // this body can never be written; a newer queued one (if any) still will
-          if (!pending.has(path)) pending.set(path, body);   // a newer queued body wins over the failed one
-          persistLocal();
+          const permanent = code === 'invalid_argument' || code === 'transform_error' || code === 'quota_exceeded' || !code;
+          if (permanent) { if (!pending.has(path)) failed.set(path, code || 'error'); dirty = true; persistLocal(); failures = 0; continue; }
+          if (!pending.has(path)) pending.set(path, body);            // a newer queued body wins over the failed one
+          dirty = true; persistLocal();
+          if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') { goOffline(); return; }
           failures += 1;
-          if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') { db = null; setDbState('off'); return; }
           if (failures >= 3) { setDbState('error', e); scheduleFlush(15000); return; }
           await sleep(400 + Math.random() * 600);
         }
@@ -113,16 +238,19 @@
       setDbState('synced');
     } finally { flushing = false; }
   }
+  function goOffline() { unsubs.forEach(u => { try { u(); } catch (e) {} }); unsubs = []; db = null; dbNs = null; setDbState('off'); }
   function docPath(col, id) { return col + '/' + id; }
+  function validPath(path) { const [col, id] = path.split('/'); return !!id && (col === 'settings' ? id === 'main' : col === 'meta' ? id === 'reset' : DATE_RE.test(id)); }
   function applyRemote(path, body) {
+    if (!validPath(path) || !isObj(body)) return false;
     const [col, id] = path.split('/');
-    if (!id || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(id) && col !== 'settings') return false;
     if (col === 'sessions') state.sessions[id] = body;
     else if (col === 'habits') state.habits[id] = body;
     else if (col === 'body') { state.body = state.body.filter(b => b.date !== id); state.body.push(Object.assign({ date: id }, body)); }
-    else if (col === 'settings') { if (id !== 'main') return false; state.settings = Object.assign({}, DEFAULT_SETTINGS, body); }
-    else return false;
-    baseline.set(path, sig(body));
+    else if (col === 'settings') state.settings = Object.assign({}, DEFAULT_SETTINGS, body);
+    else if (col === 'meta') { state.resetAt = Math.max(state.resetAt || 0, Number(body.at) || 0); pruneBeforeReset(); }
+    baseline.set(path, sig(records().get(path) || body));
+    dirty = true;
     return true;
   }
   function removeLocal(path) {
@@ -131,54 +259,98 @@
     else if (col === 'habits') delete state.habits[id];
     else if (col === 'body') state.body = state.body.filter(b => b.date !== id);
     else return false;
-    baseline.delete(path);
+    baseline.delete(path); lastSynced.delete(path); dirty = true;
     return true;
   }
-  const ts = (b) => (b && typeof b.updatedAt === 'number') ? b.updatedAt : 0;
+  function pruneBeforeReset() {
+    if (!state.resetAt) return;
+    records().forEach((b, path) => { const col = path.split('/')[0]; if ((col === 'sessions' || col === 'body' || col === 'habits') && ts(b) < state.resetAt) { removeLocal(path); pending.delete(path); } });
+  }
 
   async function connectDb() {
     if (!(window.claude && typeof window.claude.use === 'function')) { setDbState('off'); return; }
     setDbState('connecting');
-    try { db = await window.claude.use('db'); } catch (e) { db = null; }
-    if (!db) { setDbState('off'); return; }
-    try { await initialMerge(); } catch (e) { setDbState('error', e); scheduleFlush(5000); return; }
-    subscribeRemote();
-    scheduleFlush(0);
+    try { dbNs = await window.claude.use('db'); } catch (e) { dbNs = null; }
+    if (!dbNs) { setDbState('off'); return; }
+    scheduleMerge(0);
+  }
+  function scheduleMerge(ms) { clearTimeout(mergeT); mergeT = setTimeout(runMerge, ms); }
+  async function runMerge() {
+    if (!dbNs || db) return;
+    setDbState('merging');
+    try {
+      await initialMerge();
+      db = dbNs; mergeAttempt = 0;
+      subscribeRemote();
+      scheduleFlush(0);
+      if (!pending.size) setDbState('synced');
+    } catch (e) {
+      const code = e && e.code;
+      if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') { goOffline(); return; }
+      mergeAttempt += 1; setDbState('error', e);
+      scheduleMerge([1000, 3000, 10000, 30000][Math.min(mergeAttempt - 1, 3)] + Math.random() * 500);  // keeps retrying every 30 s
+    }
+  }
+  async function getAll(c) {
+    try { return await dbNs.collection(c).get(); }
+    catch (e) { if (e && e.code === 'unavailable') { await sleep(300 + Math.random() * 400); return dbNs.collection(c).get(); } throw e; }
   }
   async function initialMerge() {
     const remote = new Map();
-    for (const c of COLLECTIONS) {
-      const snap = await db.collection(c).get();
-      snap.docs.forEach(d => { if (d.exists) remote.set(docPath(c, d.id), d.data()); });
-    }
+    for (const c of COLLECTIONS) { const snap = await getAll(c); snap.docs.forEach(d => { if (d.exists) remote.set(docPath(c, d.id), d.data()); }); }
+    flushLocalNow();                                                    // stamp anything typed while we were downloading
+    const rr = remote.get('meta/reset'); if (rr && Number(rr.at) > (state.resetAt || 0)) { state.resetAt = Number(rr.at); baseline.set('meta/reset', sig(records().get('meta/reset'))); pruneBeforeReset(); }
     const local = records();
     let changed = false;
-    const paths = new Set([...remote.keys(), ...local.keys()]);
-    paths.forEach(path => {
+    new Set([...remote.keys(), ...local.keys()]).forEach(path => {
+      if (!validPath(path)) return;
       const r = remote.get(path), l = local.get(path);
-      if (pending.has(path) && pending.get(path) === null) return;        // a local delete is still queued: it wins
-      const rt = r ? ts(r) : -1, lt = l ? ts(l) : -1;
-      if (r && rt > lt) { if (applyRemote(path, clone(r))) { pending.delete(path); changed = true; } }
-      else if (l && (!r || lt > rt)) { if (!l.updatedAt) l.updatedAt = Date.now(); baseline.set(path, sig(l)); pending.set(path, clone(l)); }
+      const res = reconcile(path, l, r);
+      if (r && !isDel(pending.get(path))) lastSynced.set(path, sig(r)); else if (!r) lastSynced.delete(path);
+      if (res.drop) { removeLocal(path); pending.delete(path); changed = true; return; }
+      if (res.apply) { applyRemote(path, res.body); pending.delete(path); changed = true; }
+      if (res.push) { const b = res.body; if (!b.updatedAt) b.updatedAt = LEGACY_TS; baseline.set(path, sig(b)); pending.set(path, clone(b)); }
+      else if (!res.apply && l && !r) pending.delete(path);
     });
-    persistLocal();
-    if (changed) render();
+    dirty = true; persistLocal();
+    if (changed) requestRender();
   }
   function subscribeRemote() {
+    unsubs.forEach(u => { try { u(); } catch (e) {} }); unsubs = [];
     COLLECTIONS.forEach(c => {
-      db.collection(c).onSnapshot(snap => {
+      const u = db.collection(c).onSnapshot(snap => {
         let changed = false;
-        snap.docChanges().forEach(ch => {
-          const path = docPath(c, ch.doc.id);
-          if (pending.has(path)) return;                                     // our own unsynced change is newer
-          if (ch.type === 'removed') { if (records().has(path)) changed = removeLocal(path) || changed; return; }
-          const r = ch.doc.data(); const l = records().get(path);
-          if (r && ts(r) > (l ? ts(l) : -1)) changed = applyRemote(path, clone(r)) || changed;
+        const changes = snap.docChanges();
+        if (changes.length && saveT) flushLocalNow();                 // typed-but-unsaved edits get stamped before anything remote lands
+        changes.forEach(ch => {
+          const path = docPath(c, ch.doc.id); if (!validPath(path)) return;
+          const l = records().get(path);
+          if (inflight.has(path)) return;                              // a write of ours is on the wire: this snapshot predates it
+          if (ch.type === 'removed') {
+            if (pending.has(path)) return;                            // our own newer change is still queued
+            if (l) { changed = removeLocal(path) || changed; }
+            return;
+          }
+          const r = ch.doc.data(); if (!r) return;
+          // a queued local write is not a reason to ignore the server: both are merged three-way against the last agreed body
+          const res = reconcile(path, l, r);
+          if (!isDel(pending.get(path))) lastSynced.set(path, sig(r));
+          if (res.apply) changed = applyRemote(path, res.body) || changed;
+          if (res.push) { const b = res.body; baseline.set(path, sig(b)); pending.set(path, clone(b)); scheduleFlush(50); }
         });
-        if (changed) { persistLocal(); render(); }
-      }, (e) => { if (e && e.code === 'revoked') { db = null; setDbState('off'); } });
+        if (changed) { dirty = true; persistLocal(); requestRender(); }
+      }, (e) => {
+        if (e && e.code === 'revoked') { goOffline(); return; }
+        // any other terminal error kills the listener: reconnect from scratch after a pause
+        unsubs.forEach(x => { try { x(); } catch (y) {} }); unsubs = []; db = null; setDbState('error', e); scheduleMerge(3000 + Math.random() * 2000);
+      });
+      unsubs.push(u);
     });
   }
+  /* Re-render, but never under the user's fingers: wait until the focused input is left. */
+  function typing() { const a = document.activeElement; return !!(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.closest('main')); }
+  function requestRender() { if (typing()) { renderQueued = true; renderSyncState(); return; } renderQueued = false; render(); }
+  document.addEventListener('focusout', () => { if (renderQueued) setTimeout(() => { if (renderQueued && !typing()) { renderQueued = false; render(); } }, 50); });
 
   /* ---------- dates ---------- */
   function pad(n) { return String(n).padStart(2, '0'); }
@@ -224,6 +396,7 @@
   function isTimed(reps) { return /min|\ss$|s\b/.test(String(reps)); }
 
   function hasLoggedSets(sess) { return !!(sess && sess.sets && Object.keys(sess.sets).some(ex => sess.sets[ex].some(x => (x.w !== '' && x.w != null) || (x.r !== '' && x.r != null) || x.done))); }
+  function hasContent(sess) { return !!(sess && (hasLoggedSets(sess) || sess.done || (sess.notes && sess.notes.trim()))); }
   function workoutName(sess) { const sp = SPLITS[sess.splitId]; const w = sp && sp.workouts[sess.workoutId]; return w ? w.name : (sess.workoutId || 'Session'); }
 
   /* previous performance of an exercise before a date */
@@ -319,11 +492,12 @@
     const root = $('#view-today'); root.innerHTML = '';
     const n = dayIndex(viewDate);
     const ph = phaseFor(n);
-    const sp = splitFor(n);
-    const spId = splitIdFor(n);
     const sess = state.sessions[viewDate];
+    const planSp = splitFor(n), planSpId = splitIdFor(n);
+    const sp = (sess && sess.splitId && SPLITS[sess.splitId] && sess.workoutId && SPLITS[sess.splitId].workouts[sess.workoutId]) ? SPLITS[sess.splitId] : planSp;
+    const spId = Object.keys(SPLITS).find(k => SPLITS[k] === sp);
     const plannedId = plannedWorkoutId(n);
-    const chosenId = sess ? sess.workoutId : plannedId;
+    const chosenId = sess ? (sp.workouts[sess.workoutId] ? sess.workoutId : null) : plannedId;
     const isToday = viewDate === todayStr();
 
     // header
@@ -384,11 +558,12 @@
     if (n < 1) return;
 
     // workout selector
-    const options = Object.keys(sp.workouts).map(id => `<option value="${id}" ${id === chosenId ? 'selected' : ''}>${esc(sp.workouts[id].name)}</option>`).join('');
+    const optionList = (sid) => Object.keys(SPLITS[sid].workouts).map(id => `<option value="${sid}|${id}" ${sid === spId && id === chosenId ? 'selected' : ''}>${esc(SPLITS[sid].workouts[id].name)}</option>`).join('');
+    const options = optionList(spId) + (planSpId !== spId ? `<optgroup label="${esc(planSp.short)} (plan)">${optionList(planSpId)}</optgroup>` : '');
     const sel = el(`
       <section class="card">
         <div class="row between">
-          <div><div class="eyebrow">${plannedId ? 'Planned' : 'Rest day'}</div><h2>${plannedId ? esc(sp.workouts[plannedId].name) : 'Recovery · walk, stretch, eat protein'}</h2></div>
+          <div><div class="eyebrow">${plannedId ? 'Planned' : 'Rest day'}</div><h2>${plannedId ? esc(planSp.workouts[plannedId].name) : 'Recovery · walk, stretch, eat protein'}</h2></div>
           ${sess && sess.done ? '<span class="chip good">Completed</span>' : ''}
         </div>
         <label class="field">Do a different session today
@@ -398,22 +573,26 @@
       </section>`);
     root.appendChild(sel);
     $('#wsel').onchange = (e) => {
-      const id = e.target.value || null;
+      const v = e.target.value || '';
       const cur = state.sessions[viewDate];
-      if (!id) {
-        if (cur && hasLoggedSets(cur)) { toast('This day has logged sets. Delete them first.'); e.target.value = cur.workoutId || ''; return; }
+      if (!v) {
+        if (cur && hasContent(cur)) { toast('This day has logged work or notes. It stays.'); e.target.value = cur.splitId + '|' + cur.workoutId; return; }
         if (cur) delete state.sessions[viewDate];
       } else {
-        state.sessions[viewDate] = Object.assign({ workoutId: id, splitId: spId, sets: {}, done: false, notes: '' }, cur || {}, { workoutId: id, splitId: spId });
+        const [sid, id] = v.split('|');
+        if (!SPLITS[sid] || !SPLITS[sid].workouts[id]) return;
+        state.sessions[viewDate] = Object.assign({ workoutId: id, splitId: sid, sets: {}, done: false, notes: '' }, cur || {}, { workoutId: id, splitId: sid });
       }
       save(true); renderToday();
     };
 
     if (!chosenId) return;
     const wk = sp.workouts[chosenId];
+    if (!wk) { root.appendChild(el(`<section class="card"><p class="small muted">This day was logged under a workout that no longer exists in the selected split. Pick a session above to continue.</p></section>`)); return; }
     // Nothing is written to storage until you type or tick something: viewing a day never creates a record.
     const s = state.sessions[viewDate] || { workoutId: chosenId, splitId: spId, sets: {}, done: false, notes: '' };
-    const commit = () => { if (state.sessions[viewDate] !== s) state.sessions[viewDate] = s; save(); };
+    // If another device's copy of this day arrived while you were typing, your typed values are merged in, never dropped.
+    const commit = () => { const cur = state.sessions[viewDate]; if (cur !== s) state.sessions[viewDate] = cur ? mergeSession(Object.assign({}, s, { updatedAt: Date.now() }), cur, baseOf('sessions/' + viewDate)) : s; save(); };
 
     const wcardEl = el(`<section class="card"><div class="row between"><div><div class="eyebrow">${esc(wk.focus)}</div><h2>${esc(wk.name)}</h2></div>${ph && ph.setMod === 'deload' ? '<span class="chip warn">Deload: 2 sets, −20% load</span>' : ''}</div>
       <p class="muted small">Your walk in was the general warm-up. Do 2–3 min of mobility, then ramp sets on the first lift (one extra on lower days). Rest times are per set. Tap ⏱ to start the rest timer.</p></section>`);
@@ -464,12 +643,12 @@
 
     const foot = el(`
       <section class="card">
-        <label class="field">Session notes (energy, pain, PRs)<textarea id="notes" style="min-height:70px;font-family:inherit;font-size:.95rem">${esc(s.notes || '')}</textarea></label>
+        <label class="field">Session notes (energy, pain, PRs)<textarea id="notes" maxlength="2000" style="min-height:70px;font-family:inherit;font-size:.95rem">${esc(s.notes || '')}</textarea></label>
         <button class="btn ${s.done ? '' : 'primary'} block" id="finish">${s.done ? 'Mark as not finished' : 'Finish workout'}</button>
       </section>`);
     root.appendChild(foot);
     $('#notes').oninput = (e) => { s.notes = e.target.value; commit(); };
-    $('#finish').onclick = () => { s.done = !s.done; s.finishedAt = s.done ? new Date().toISOString() : null; if (state.sessions[viewDate] !== s) state.sessions[viewDate] = s; save(true); toast(s.done ? 'Workout logged. Eat.' : 'Reopened'); renderToday(); };
+    $('#finish').onclick = () => { s.done = !s.done; s.finishedAt = s.done ? new Date().toISOString() : null; commit(); save(true); toast(s.done ? 'Workout logged. Eat.' : 'Reopened'); renderToday(); };
   }
 
   /* morning timeline from wake time */
@@ -824,11 +1003,8 @@
       <div class="row"><button class="btn sm" id="syncNow" ${db ? '' : 'disabled'}>Sync now</button><span class="chip" id="syncchip"></span></div>
       <p class="muted small">Inside claude.ai this page saves every change to your account's database as well as the device, so the same logs show on phone and laptop. Opened as a plain file or from GitHub Pages it saves on the device only.</p></section>`);
     root.appendChild(sy);
-    const counts = `${Object.keys(state.sessions).length} sessions · ${state.body.length} weigh-ins · ${Object.keys(state.habits).length} habit days`;
-    $('#syncdetail', sy).textContent = counts;
-    $('#syncchip', sy).textContent = dbState === 'off' ? 'Device only' : dbState === 'synced' ? 'Synced' : dbState === 'error' ? 'Sync retrying' : 'Syncing…';
-    $('#syncchip', sy).className = 'chip ' + (dbState === 'synced' ? 'good' : dbState === 'error' ? 'warn' : '');
-    $('#syncNow', sy).onclick = () => { save(true); toast('Syncing'); };
+    $('#syncNow', sy).onclick = () => { if (dbNs && !db) scheduleMerge(0); save(true); toast('Syncing'); };
+    renderSyncState();
 
     const io = el(`<section class="card"><h3>Backup and restore</h3>
       <p class="muted small">Your data lives only in this browser. Copy the backup text somewhere safe once a week (notes app, email to yourself). Paste it back here on a new phone.</p>
@@ -845,23 +1021,34 @@
       try {
         const obj = JSON.parse($('#ioText').value); if (!obj || !obj.settings) throw new Error('bad');
         const incoming = Object.assign({ sessions: {}, body: [], habits: {} }, obj); incoming.settings = Object.assign({}, DEFAULT_SETTINGS, obj.settings);
-        // merge instead of replace: a backup never erases newer logs on this device
-        Object.keys(incoming.sessions).forEach(d => { if (!state.sessions[d] || ts(incoming.sessions[d]) >= ts(state.sessions[d])) state.sessions[d] = incoming.sessions[d]; });
-        Object.keys(incoming.habits).forEach(d => { if (!state.habits[d] || ts(incoming.habits[d]) >= ts(state.habits[d])) state.habits[d] = incoming.habits[d]; });
-        incoming.body.forEach(b => { const cur = state.body.find(x => x.date === b.date); if (!cur || ts(b) >= ts(cur)) { state.body = state.body.filter(x => x.date !== b.date); state.body.push(b); } });
-        if (ts(incoming.settings) >= ts(state.settings)) state.settings = incoming.settings;
-        save(true); toast('Restored and merged'); render();
+        // merge instead of replace: a backup never erases newer logs on this device, and nothing in it is lost either
+        const inc = sanitize(incoming);
+        const theirs = new Map();
+        Object.keys(inc.sessions).forEach(d => theirs.set('sessions/' + d, inc.sessions[d]));
+        inc.body.forEach(b => theirs.set('body/' + b.date, b));
+        Object.keys(inc.habits).forEach(d => theirs.set('habits/' + d, inc.habits[d]));
+        theirs.set('settings/main', inc.settings);
+        let applied = 0;
+        theirs.forEach((r, path) => { if (!r.updatedAt) r.updatedAt = LEGACY_TS; const l = records().get(path); const res = reconcile(path, l, r); if (res.apply || (!l && res.body)) { const body = res.body || r; const [col, id] = path.split('/'); if (col === 'sessions') state.sessions[id] = body; else if (col === 'habits') state.habits[id] = body; else if (col === 'body') { state.body = state.body.filter(x => x.date !== id); state.body.push(Object.assign({ date: id }, body)); } else if (col === 'settings') state.settings = Object.assign({}, DEFAULT_SETTINGS, body); applied++; } });
+        save(true); toast(`Restored: ${applied} record${applied === 1 ? '' : 's'} added or merged`); render();
       }
       catch (e) { toast('That text is not a valid backup'); }
     };
 
-    const rs = el(`<section class="card"><h3>Start over</h3><p class="muted small">Deletes every logged workout, weigh-in and habit on this device. Settings stay.</p>
+    const rs = el(`<section class="card"><h3>Start over</h3><p class="muted small">Deletes every logged workout, weigh-in and habit from this device <b>and from your account, on every device</b>. Settings stay. A backup of everything is placed in the box above first.</p>
       <button class="btn danger" id="rs1">Delete all logs</button>
-      <div class="confirm" id="rsBox" hidden><p class="small"><b>Are you sure?</b> This cannot be undone. Create a backup first if in doubt.</p><div class="row" style="margin-top:8px"><button class="btn danger" id="rs2">Yes, delete everything</button><button class="btn" id="rs3">Cancel</button></div></div></section>`);
+      <div class="confirm" id="rsBox" hidden><p class="small"><b>This cannot be undone.</b> Type <b>DELETE</b> to confirm.</p><div class="row" style="margin-top:8px"><input type="text" id="rsWord" placeholder="DELETE" style="max-width:140px" autocomplete="off"><button class="btn danger" id="rs2" disabled>Delete everything</button><button class="btn" id="rs3">Cancel</button></div></div></section>`);
     root.appendChild(rs);
-    $('#rs1').onclick = () => { $('#rsBox').hidden = false; };
+    $('#rs1').onclick = () => { $('#rsBox').hidden = false; $('#rsWord').focus(); };
     $('#rs3').onclick = () => { $('#rsBox').hidden = true; };
-    $('#rs2').onclick = () => { state.sessions = {}; state.body = []; state.habits = {}; save(true); toast('Logs deleted'); render(); };
+    $('#rsWord').oninput = (e) => { $('#rs2').disabled = e.target.value.trim() !== 'DELETE'; };
+    $('#rs2').onclick = () => {
+      if ($('#rsWord').value.trim() !== 'DELETE') return;
+      const backup = JSON.stringify(state);
+      state.resetAt = Date.now(); state.sessions = {}; state.body = []; state.habits = {}; pending.forEach((v, k) => { if (!/^(settings|meta)\//.test(k)) pending.delete(k); });
+      save(true); toast('Logs deleted. Backup text is in the box above.'); render();
+      const ta = $('#ioText'); if (ta) ta.value = backup;
+    };
 
     root.appendChild(el(`<section class="card"><h3>About</h3><p class="small muted">Rebuild 100 is a self-contained web app: open it on your phone, add it to the home screen, and it works offline after the first load. Training plan: Upper/Lower 4-day → U/L + Push/Pull/Legs 5-day, with upper-chest and biceps priority and a recomposition nutrition plan.</p></section>`));
   }
