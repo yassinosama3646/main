@@ -9,25 +9,28 @@
      Durable copies: localStorage (always, instant) and the artifact's `db` capability
      (when the claude.ai viewer grants it: survives reloads, devices and republishes).
      Records: sessions/<date>, body/<date>, habits/<date>, settings/main, meta/reset.
+     Conflict model: every set row, note and field carries its own edit time (`t`); on a
+     conflict the newest edit wins and everything else is kept (union). No shared base is
+     needed, so a missed update or a stale tab can never erase another device's work.
      Rules that protect data:
        - nothing is written to the account until the first download (merge) succeeded;
-       - sessions merge per exercise and per set (union), never whole-record replace;
-       - deletes carry a timestamp and lose to a newer remote write;
-       - a reset writes a tombstone so stale devices do not resurrect old logs;
+       - deletes carry a timestamp and lose to a newer remote write; records with content
+         are never dropped by a remote delete, they are re-uploaded;
+       - a reset writes a tombstone; it prunes only records that are provably older;
        - unsynced changes live in a persisted queue, so a killed tab loses nothing. */
-  const PENDING_KEY = KEY + '.pending', FAILED_KEY = KEY + '.failed', SYNCED_KEY = KEY + '.synced';
-  const LEGACY_TS = 1;                  // stamp for records that predate timestamps
+  const PENDING_KEY = KEY + '.pending', FAILED_KEY = KEY + '.failed', BACKUP_KEY = KEY + '.lastBackup';
+  const LEGACY_TS = 1;                  // doc stamp for records that predate timestamps
   const isObj = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
   const DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
   let state = load();
   let pending = loadMap(PENDING_KEY);   // path -> body | {__del:true, at}
   let failed = loadMap(FAILED_KEY);     // path -> error code (permanent write failures)
-  let lastSynced = loadMap(SYNCED_KEY); // path -> signature of the last body both sides agreed on (3-way merge base)
-  let baseline = new Map();             // path -> signature of the last persisted body
+  let baseline = new Map();             // path -> canonical JSON of the last persisted body (for change detection)
   let dbNs = null, db = null;           // dbNs: namespace once granted; db: same, but only after the first merge succeeded
-  let dbState = 'off', dbErr = null, flushing = false, flushT = null, failures = 0, mergeAttempt = 0, mergeT = null, unsubs = [];
+  let dbState = 'off', dbErr = null, dbErrKind = null, flushing = false, flushT = null, failures = 0, mergeAttempt = 0, mergeT = null, merging = false, unsubs = [];
   let dirty = false, renderQueued = false;
   const inflight = new Set();           // paths whose write is on the wire: snapshots about them are stale by definition
+  const dirtyInputs = new Map();        // id -> value typed into a form that commits on a button, kept across re-renders
   let viewDate = todayStr();
   let activeTab = 'today';
   let restTimer = null;
@@ -37,7 +40,9 @@
     const s = isObj(raw) ? raw : {};
     const out = {};
     out.settings = Object.assign({}, DEFAULT_SETTINGS, isObj(s.settings) ? s.settings : {});
-    out.sessions = {}; if (isObj(s.sessions)) Object.keys(s.sessions).forEach(d => { const v = s.sessions[d]; if (DATE_RE.test(d) && isObj(v)) { v.sets = isObj(v.sets) ? v.sets : {}; Object.keys(v.sets).forEach(ex => { if (!Array.isArray(v.sets[ex])) delete v.sets[ex]; else v.sets[ex] = v.sets[ex].filter(isObj); }); out.sessions[d] = v; } });
+    if (out.settings.splitOverride && !SPLITS[out.settings.splitOverride]) out.settings.splitOverride = null;
+    if (!isObj(out.settings.t)) delete out.settings.t;
+    out.sessions = {}; if (isObj(s.sessions)) Object.keys(s.sessions).forEach(d => { const v = s.sessions[d]; if (DATE_RE.test(d) && isObj(v)) { v.sets = isObj(v.sets) ? v.sets : {}; Object.keys(v.sets).forEach(ex => { if (!Array.isArray(v.sets[ex])) delete v.sets[ex]; else v.sets[ex] = v.sets[ex].map(r => isObj(r) ? r : { w: '', r: '', done: false }); }); if (!isObj(v.t)) delete v.t; out.sessions[d] = v; } });
     out.body = Array.isArray(s.body) ? s.body.filter(b => isObj(b) && DATE_RE.test(b.date) && isFinite(Number(b.kg))) : [];
     out.habits = {}; if (isObj(s.habits)) Object.keys(s.habits).forEach(d => { if (DATE_RE.test(d) && isObj(s.habits[d])) out.habits[d] = s.habits[d]; });
     out.resetAt = typeof s.resetAt === 'number' ? s.resetAt : 0;
@@ -46,10 +51,15 @@
   function load() { let raw = null; try { raw = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { raw = null; } return sanitize(raw); }
   function loadMap(key) { try { const a = JSON.parse(localStorage.getItem(key) || '[]'); return new Map(Array.isArray(a) ? a.filter(e => Array.isArray(e) && typeof e[0] === 'string').map(e => [e[0], e[1] === null ? { __del: true, at: 0 } : e[1]]) : []); } catch (e) { return new Map(); } }
   const clone = (o) => JSON.parse(JSON.stringify(o));
-  const sig = (body) => JSON.stringify(body, (k, v) => k === 'updatedAt' ? undefined : v);
-  const DEFAULT_SIG = sig(DEFAULT_SETTINGS);
+  /* canonical form: sorted keys, no updatedAt; two bodies with the same content give the same string on every device */
+  function canon(v) { if (Array.isArray(v)) return v.map(canon); if (isObj(v)) { const o = {}; Object.keys(v).sort().forEach(k => { if (k !== 'updatedAt' && v[k] !== undefined) o[k] = canon(v[k]); }); return o; } return v; }
+  const sig = (body) => JSON.stringify(canon(body));
   const ts = (b) => (b && typeof b.updatedAt === 'number') ? b.updatedAt : 0;
   const isDel = (v) => !!(v && v.__del);
+  const filled = (v) => !(v === '' || v == null);
+  const same = (a, b) => String(a == null ? '' : a) === String(b == null ? '' : b);
+  const tmap = (b) => (b && isObj(b.t)) ? b.t : {};
+  const untouched = (settings) => Object.keys(tmap(settings)).length === 0;
 
   /* Flattened view: db path -> the live state object that is the document body. */
   function records() {
@@ -64,24 +74,48 @@
   function rebuildBaseline() { baseline = new Map(); records().forEach((b, p) => baseline.set(p, sig(b))); }
   rebuildBaseline();
 
-  /* Compare live state with the last persisted signatures; stamp and queue what changed. */
+  /* Stamp the fields that changed since the last persisted version with the edit time. */
+  function stampChanges(col, body, prevSig, now) {
+    let prev = null; try { prev = prevSig ? JSON.parse(prevSig) : null; } catch (e) { prev = null; }
+    if (col === 'meta') return;
+    body.t = isObj(body.t) ? body.t : {};
+    // A field on a brand-new record is only "edited" if it holds something: an empty draft claims nothing.
+    if (col === 'sessions') {
+      const ps = (prev && isObj(prev.sets)) ? prev.sets : {};
+      Object.keys(body.sets || {}).forEach(ex => {
+        const rows = body.sets[ex], prows = Array.isArray(ps[ex]) ? ps[ex] : [];
+        rows.forEach((row, i) => {
+          const q = prows[i];
+          if (!q) { if (filled(row.w) || filled(row.r) || row.done) row.t = now; }
+          else if (!same(q.w, row.w) || !same(q.r, row.r) || !!q.done !== !!row.done) row.t = now;
+          else if (row.t == null && q.t != null) row.t = q.t;
+        });
+      });
+      if (prev ? (prev.workoutId !== body.workoutId || prev.splitId !== body.splitId) : !!body.workoutId) body.t.meta = now;
+      if (prev ? (!!prev.done !== !!body.done || (prev.finishedAt || null) !== (body.finishedAt || null)) : !!body.done) body.t.done = now;
+      if (prev ? ((prev.notes || '') !== (body.notes || '')) : !!(body.notes && body.notes.trim())) body.t.notes = now;
+    } else {
+      Object.keys(body).forEach(k => { if (k === 't' || k === 'updatedAt' || k === 'date') return; if (prev ? !same(JSON.stringify(prev[k]), JSON.stringify(body[k])) : filled(body[k])) body.t[k] = now; });
+    }
+  }
+  /* Compare live state with the last persisted version; stamp and queue what changed. */
   function diffAndQueue() {
     const now = Date.now();
     const live = records();
     live.forEach((body, path) => {
+      const col = path.split('/')[0];
       const sg = sig(body);
-      if (baseline.get(path) !== sg) { body.updatedAt = now; baseline.set(path, sg); pending.set(path, clone(body)); failed.delete(path); dirty = true; }
+      const prevSig = baseline.get(path);
+      if (prevSig !== sg) { stampChanges(col, body, prevSig, now); body.updatedAt = now; baseline.set(path, sig(body)); pending.set(path, clone(body)); failed.delete(path); dirty = true; }
     });
-    Array.from(baseline.keys()).forEach(path => { if (!live.has(path)) { baseline.delete(path); pending.set(path, { __del: true, at: now }); dirty = true; } });
+    Array.from(baseline.keys()).forEach(path => { if (!live.has(path)) { baseline.delete(path); pending.set(path, { __del: true, at: now }); failed.delete(path); dirty = true; } });
   }
   function persistLocal(force) {
     if (!dirty && !force) return;                                   // a tab that changed nothing never overwrites another tab's work
     try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
     try { localStorage.setItem(PENDING_KEY, JSON.stringify(Array.from(pending.entries()))); } catch (e) { /* storage unavailable */ }
     try { localStorage.setItem(FAILED_KEY, JSON.stringify(Array.from(failed.entries()))); } catch (e) { /* storage unavailable */ }
-    try { localStorage.setItem(SYNCED_KEY, JSON.stringify(Array.from(lastSynced.entries()))); } catch (e) { /* storage unavailable */ }
   }
-  function baseOf(path) { const sg = lastSynced.get(path); if (!sg) return null; try { return JSON.parse(sg); } catch (e) { return null; } }
   let saveT = null;
   function flushLocalNow() { clearTimeout(saveT); saveT = null; const before = pending.size; diffAndQueue(); persistLocal(); if (pending.size !== before) scheduleFlush(0); }
   function save(now) {
@@ -95,74 +129,83 @@
   window.addEventListener('storage', (e) => {
     if (e.key !== KEY || !e.newValue) return;
     let other = null; try { other = sanitize(JSON.parse(e.newValue)); } catch (x) { return; }
+    let changed = false;
+    if ((other.resetAt || 0) > (state.resetAt || 0)) { state.resetAt = other.resetAt; pruneBeforeReset(); changed = true; }
     const theirs = new Map();
     Object.keys(other.sessions).forEach(d => theirs.set('sessions/' + d, other.sessions[d]));
     other.body.forEach(b => theirs.set('body/' + b.date, b));
     Object.keys(other.habits).forEach(d => theirs.set('habits/' + d, other.habits[d]));
     theirs.set('settings/main', other.settings);
-    let changed = false;
     theirs.forEach((r, path) => { const res = reconcile(path, records().get(path), r); if (res.apply) { applyRemote(path, res.body); changed = true; } });
-    if (changed) requestRender();
+    if (changed) { dirty = true; persistLocal(); requestRender(); }
   });
 
-  /* ----- merging: union, newer wins on a real conflict, deterministic ----- */
-  function newerFirst(a, b) { const ta = ts(a), tb = ts(b); if (ta !== tb) return ta > tb ? [a, b] : [b, a]; return JSON.stringify(a) >= JSON.stringify(b) ? [a, b] : [b, a]; }
-  const filled = (v) => !(v === '' || v == null);
-  /* Three-way cell merge: n = newer side, o = older side, b = common base (may be undefined).
-     Only one side changed from the base -> that side. Both changed -> prefer a filled value, then the newer side. */
-  const same = (a, b) => String(a == null ? '' : a) === String(b == null ? '' : b);
-  function cell(nv, ov, bv, hasBase) {
-    if (hasBase) { if (same(nv, bv)) return ov; if (same(ov, bv)) return nv; }
-    if (filled(nv)) return nv; if (filled(ov)) return ov; return nv == null ? ov : nv;
+  /* ----- merging: per-field newest-wins, union otherwise, deterministic ties ----- */
+  const rowT = (r) => (r && typeof r.t === 'number') ? r.t : 0;
+  const cmpJson = (a, b) => JSON.stringify(canon(a)) >= JSON.stringify(canon(b));
+  function pickRow(a, b, da, dbb) {
+    if (!a) return clone(b); if (!b) return clone(a);
+    const ta = rowT(a), tb = rowT(b);
+    if (ta !== tb) return clone(ta > tb ? a : b);
+    const fa = filled(a.w) || filled(a.r), fb = filled(b.w) || filled(b.r);
+    if (fa !== fb) return clone(fa ? a : b);
+    if (!!a.done !== !!b.done) return clone(a.done ? a : b);
+    if (da !== dbb) return clone(da > dbb ? a : b);
+    return clone(cmpJson(a, b) ? a : b);
   }
-  function mergeSession(x, y, base) {
-    const [n, o] = newerFirst(x, y);
-    const hb = isObj(base); const bs = (hb && base.sets) || {};
-    const out = {
-      workoutId: cell(n.workoutId, o.workoutId, hb ? base.workoutId : null, hb) || null,
-      splitId: cell(n.splitId, o.splitId, hb ? base.splitId : null, hb) || null,
-      sets: {}, done: false, notes: '', finishedAt: null,
-    };
-    const bd = hb ? !!base.done : false;
-    out.done = hb ? ((!!n.done !== bd) ? !!n.done : !!o.done) : !!(n.done || o.done);
-    out.finishedAt = cell(n.finishedAt, o.finishedAt, hb ? base.finishedAt : null, hb) || null;
-    const exs = new Set([...Object.keys(n.sets || {}), ...Object.keys(o.sets || {})]);
-    exs.forEach(ex => {
-      const a = (n.sets && n.sets[ex]) || [], b = (o.sets && o.sets[ex]) || [], c = bs[ex] || [];
-      const len = Math.max(a.length, b.length); const rows = [];
-      for (let i = 0; i < len; i++) {
-        const ra = a[i] || {}, rb = b[i] || {}, rc = c[i] || {};
-        const hasB = hb && !!c[i];
-        const w = cell(ra.w, rb.w, rc.w, hasB), r = cell(ra.r, rb.r, rc.r, hasB);
-        const done = hasB ? ((!!ra.done !== !!rc.done) ? !!ra.done : !!rb.done) : !!(ra.done || rb.done);
-        rows.push({ w: w == null ? '' : w, r: r == null ? '' : r, done });
-      }
+  function pickSide(ta, tb, a, b, tie, da, dbb) { if (ta !== tb) return ta > tb ? 'a' : 'b'; const t2 = tie ? tie() : null; if (t2) return t2; if (da !== dbb) return da > dbb ? 'a' : 'b'; return cmpJson(a, b) ? 'a' : 'b'; }
+  function mergeSession(a, b) {
+    const ta = tmap(a), tb = tmap(b), da = ts(a), dbb = ts(b);
+    const out = { sets: {}, t: {} };
+    const meta = pickSide(ta.meta || 0, tb.meta || 0, [a.workoutId, a.splitId], [b.workoutId, b.splitId], () => (!!a.workoutId !== !!b.workoutId ? (a.workoutId ? 'a' : 'b') : null), da, dbb);
+    const ms = meta === 'a' ? a : b; out.workoutId = ms.workoutId || (meta === 'a' ? b : a).workoutId || null; out.splitId = ms.splitId || (meta === 'a' ? b : a).splitId || null; out.t.meta = Math.max(ta.meta || 0, tb.meta || 0);
+    const dn = pickSide(ta.done || 0, tb.done || 0, [a.done, a.finishedAt], [b.done, b.finishedAt], () => (!!a.done !== !!b.done ? (a.done ? 'a' : 'b') : null), da, dbb);
+    const ds = dn === 'a' ? a : b; out.done = !!ds.done; out.finishedAt = ds.finishedAt || (ds.done ? ((dn === 'a' ? b : a).finishedAt || null) : null); out.t.done = Math.max(ta.done || 0, tb.done || 0);
+    const na = a.notes || '', nb = b.notes || '';
+    if ((ta.notes || 0) !== (tb.notes || 0)) out.notes = (ta.notes || 0) > (tb.notes || 0) ? na : nb;
+    else if (!na || !nb || na === nb) out.notes = na || nb;
+    else out.notes = na.includes(nb) ? na : (nb.includes(na) ? nb : (da !== dbb ? (da > dbb ? na + '\n' + nb : nb + '\n' + na) : (na + '\n' + nb)).trim());
+    out.t.notes = Math.max(ta.notes || 0, tb.notes || 0);
+    new Set([...Object.keys(a.sets || {}), ...Object.keys(b.sets || {})]).forEach(ex => {
+      const ra = (a.sets && a.sets[ex]) || [], rb = (b.sets && b.sets[ex]) || [];
+      const rows = []; for (let i = 0; i < Math.max(ra.length, rb.length); i++) rows.push(pickRow(ra[i], rb[i], da, dbb));
       out.sets[ex] = rows;
     });
-    const nn = n.notes || '', on = o.notes || '', bn = hb ? (base.notes || '') : null;
-    if (hb && nn === bn) out.notes = on; else if (hb && on === bn) out.notes = nn;
-    else out.notes = nn.includes(on) ? nn : (on.includes(nn) ? on : (nn + '\n' + on).trim());
-    out.updatedAt = Math.max(ts(n), ts(o));
+    out.updatedAt = Math.max(ts(a), ts(b));
     return out;
   }
-  function mergeFlat(x, y, base) {
-    const [n, o] = newerFirst(x, y); const hb = isObj(base);
-    const out = {}; new Set([...Object.keys(o), ...Object.keys(n)]).forEach(k => { if (k === 'updatedAt') return; out[k] = hb ? cell(n[k], o[k], base[k], Object.prototype.hasOwnProperty.call(base, k) || true) : (n[k] != null ? n[k] : o[k]); });
-    out.updatedAt = Math.max(ts(n), ts(o)); return out;
+  function mergeFlat(a, b) {
+    const ta = tmap(a), tb = tmap(b), da = ts(a), dbb = ts(b); const out = { t: {} };
+    new Set([...Object.keys(a), ...Object.keys(b)]).forEach(k => {
+      if (k === 't' || k === 'updatedAt') return;
+      const ka = ta[k] || 0, kb = tb[k] || 0;
+      let side;
+      if (ka !== kb) side = ka > kb ? 'a' : 'b';
+      else if (filled(a[k]) !== filled(b[k])) side = filled(a[k]) ? 'a' : 'b';
+      else if (da !== dbb) side = da > dbb ? 'a' : 'b';
+      else side = cmpJson(a[k], b[k]) ? 'a' : 'b';
+      out[k] = side === 'a' ? a[k] : b[k]; if (Math.max(ka, kb)) out.t[k] = Math.max(ka, kb);
+    });
+    out.updatedAt = Math.max(ts(a), ts(b));
+    return out;
   }
-  function mergeSettings(x, y, base) {
-    const xd = sig(x) === DEFAULT_SIG, yd = sig(y) === DEFAULT_SIG;
-    if (xd !== yd) return clone(xd ? y : x);                        // untouched defaults never beat real settings
-    return mergeFlat(x, y, base);
+  function mergeSettings(a, b) {
+    const ua = untouched(a), ub = untouched(b);
+    if (ua !== ub) return clone(ua ? b : a);                                        // an edited settings record beats one nobody touched
+    if (ua && ub) { const da = sig(stripT(a)) === DEFAULT_SIG, dbb = sig(stripT(b)) === DEFAULT_SIG; if (da !== dbb) return clone(da ? b : a); }
+    return mergeFlat(a, b);
   }
-  function mergeBodies(col, x, y, base) {
-    if (col === 'sessions') return mergeSession(x, y, base);
-    if (col === 'habits' || col === 'body') return mergeFlat(x, y, base);
-    if (col === 'settings') return mergeSettings(x, y, base);
-    return clone(newerFirst(x, y)[0]);
+  function stripT(o) { const c = Object.assign({}, o); delete c.t; delete c.updatedAt; return c; }
+  const DEFAULT_SIG = sig(DEFAULT_SETTINGS);
+  function mergeBodies(col, a, b) {
+    if (col === 'sessions') return mergeSession(a, b);
+    if (col === 'settings') return mergeSettings(a, b);
+    if (col === 'habits' || col === 'body') return mergeFlat(a, b);
+    return clone(ts(a) >= ts(b) ? a : b);
   }
+  const olderThanReset = (b) => !!state.resetAt && ts(b) >= 1 && ts(b) < state.resetAt;   // only provably older records
   /* Decide what to do for one path given the local record (l) and the remote one (r).
-     Returns {body, apply, push}: apply = replace local with body, push = write body to the account. */
+     Returns {body, apply, push, drop}: apply = replace local with body, push = write body to the account, drop = delete locally. */
   function reconcile(path, l, r) {
     const col = path.split('/')[0];
     const pend = pending.get(path);
@@ -171,25 +214,24 @@
       return { body: null, apply: false, push: false };
     }
     if (r && !l) {
-      if (state.resetAt && ts(r) < state.resetAt) return { body: null, apply: false, push: false };
+      if (col !== 'settings' && col !== 'meta' && olderThanReset(r)) return { body: null, apply: false, push: false };
       return { body: clone(r), apply: true, push: false };
     }
     if (l && !r) {
-      if (col === 'settings' && sig(l) === DEFAULT_SIG) return { body: null, apply: false, push: false };        // never upload untouched defaults
-      if (state.resetAt && ts(l) < state.resetAt && col !== 'meta' && col !== 'settings') return { body: null, apply: false, push: false, drop: true };
+      if (col === 'settings' && untouched(l)) return { body: null, apply: false, push: false };          // never upload settings nobody edited
+      if (col !== 'settings' && col !== 'meta' && olderThanReset(l)) return { body: null, apply: false, push: false, drop: true };
       return { body: l, apply: false, push: true };
     }
     if (!l && !r) return { body: null, apply: false, push: false };
-    if (sig(l) === sig(r)) { lastSynced.set(path, sig(r)); return { body: l, apply: false, push: false }; }
-    const m = mergeBodies(col, l, r, baseOf(path));
+    if (sig(l) === sig(r)) return { body: l, apply: false, push: false };
+    const m = mergeBodies(col, l, r);
     const changedLocal = sig(m) !== sig(l), changedRemote = sig(m) !== sig(r);
-    if (changedRemote) m.updatedAt = Math.max(ts(l), ts(r), m.updatedAt || 0) + 1;    // so every device sees the merge as newer
-    else m.updatedAt = ts(r);
+    m.updatedAt = changedRemote ? Math.max(ts(l), ts(r), m.updatedAt || 0) + 1 : ts(r);   // so every device sees the merge as newer
     return { body: m, apply: changedLocal || ts(m) !== ts(l), push: changedRemote };
   }
 
   /* ----- db sync ----- */
-  function setDbState(st, err) { dbState = st; dbErr = err || null; renderSyncState(); }
+  function setDbState(st, err, kind) { dbState = st; dbErr = err || null; dbErrKind = kind || null; renderSyncState(); }
   function renderSyncState() {
     const n = pending.size, f = failed.size;
     const map = {
@@ -198,13 +240,13 @@
       merging: 'Saved on device · downloading your logs…',
       syncing: `Syncing ${n} change${n === 1 ? '' : 's'}…`,
       synced: 'Saved on this device and in your account',
-      error: `Saved on device · ${n} change${n === 1 ? '' : 's'} waiting to sync (retrying)`,
+      error: dbErrKind === 'download' ? 'Saved on device · could not download your logs yet (retrying)' : dbErrKind === 'listener' ? 'Saved on device · live updates interrupted (reconnecting)' : `Saved on device · ${n} change${n === 1 ? '' : 's'} waiting to sync (retrying)`,
     };
     let text = map[dbState] || '';
     if (f && dbState !== 'off') text += ` · ${f} record${f === 1 ? '' : 's'} could not be saved to your account`;
     const line = document.getElementById('syncstate'); if (line) { line.textContent = text; line.dataset.state = f && dbState === 'synced' ? 'error' : dbState; }
-    const chip = document.getElementById('syncchip'); if (chip) { chip.textContent = dbState === 'off' ? 'Device only' : dbState === 'synced' ? (f ? 'Synced with errors' : 'Synced') : dbState === 'error' ? 'Sync retrying' : 'Connecting…'; chip.className = 'chip ' + (dbState === 'synced' && !f ? 'good' : dbState === 'error' || f ? 'warn' : ''); }
-    const btn = document.getElementById('syncNow'); if (btn) btn.disabled = !dbNs;
+    const chip = document.getElementById('syncchip'); if (chip) { const label = { off: 'Device only', synced: f ? 'Synced with errors' : 'Synced', error: 'Sync retrying', syncing: 'Syncing…', merging: 'Downloading…', connecting: 'Connecting…' }; chip.textContent = label[dbState] || ''; chip.className = 'chip ' + (dbState === 'synced' && !f ? 'good' : dbState === 'error' || f ? 'warn' : ''); }
+    const btn = document.getElementById('syncNow'); if (btn) btn.disabled = !dbNs || merging;
     const det = document.getElementById('syncdetail'); if (det) det.textContent = `${Object.keys(state.sessions).length} sessions · ${state.body.length} weigh-ins · ${Object.keys(state.habits).length} habit days`;
   }
   function scheduleFlush(ms) { if (!db) return; clearTimeout(flushT); flushT = setTimeout(flush, ms || 0); }
@@ -219,9 +261,9 @@
         const [path, body] = pending.entries().next().value;
         pending.delete(path); inflight.add(path);
         try {
-          if (isDel(body)) { await db.doc(path).delete(); lastSynced.delete(path); } else { await db.doc(path).set(body); lastSynced.set(path, sig(body)); }
+          if (isDel(body)) await db.doc(path).delete(); else await db.doc(path).set(body);
           inflight.delete(path);
-          failures = 0; dirty = true; persistLocal(); renderSyncState();
+          failures = 0; failed.delete(path); dirty = true; persistLocal(); renderSyncState();
         } catch (e) {
           inflight.delete(path);
           const code = e && e.code;
@@ -231,7 +273,7 @@
           dirty = true; persistLocal();
           if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') { goOffline(); return; }
           failures += 1;
-          if (failures >= 3) { setDbState('error', e); scheduleFlush(15000); return; }
+          if (failures >= 3) { setDbState('error', e, 'upload'); scheduleFlush(15000); return; }
           await sleep(400 + Math.random() * 600);
         }
       }
@@ -247,7 +289,7 @@
     if (col === 'sessions') state.sessions[id] = body;
     else if (col === 'habits') state.habits[id] = body;
     else if (col === 'body') { state.body = state.body.filter(b => b.date !== id); state.body.push(Object.assign({ date: id }, body)); }
-    else if (col === 'settings') state.settings = Object.assign({}, DEFAULT_SETTINGS, body);
+    else if (col === 'settings') { state.settings = Object.assign({}, DEFAULT_SETTINGS, body); if (state.settings.splitOverride && !SPLITS[state.settings.splitOverride]) state.settings.splitOverride = null; }
     else if (col === 'meta') { state.resetAt = Math.max(state.resetAt || 0, Number(body.at) || 0); pruneBeforeReset(); }
     baseline.set(path, sig(records().get(path) || body));
     dirty = true;
@@ -259,12 +301,18 @@
     else if (col === 'habits') delete state.habits[id];
     else if (col === 'body') state.body = state.body.filter(b => b.date !== id);
     else return false;
-    baseline.delete(path); lastSynced.delete(path); dirty = true;
+    baseline.delete(path); failed.delete(path); dirty = true;
     return true;
   }
   function pruneBeforeReset() {
     if (!state.resetAt) return;
-    records().forEach((b, path) => { const col = path.split('/')[0]; if ((col === 'sessions' || col === 'body' || col === 'habits') && ts(b) < state.resetAt) { removeLocal(path); pending.delete(path); } });
+    records().forEach((b, path) => { const col = path.split('/')[0]; if ((col === 'sessions' || col === 'body' || col === 'habits') && olderThanReset(b)) { removeLocal(path); pending.delete(path); } });
+  }
+  function anyContent(col, b) {
+    if (col === 'sessions') return hasContent(b);
+    if (col === 'body') return filled(b.kg) || filled(b.waist);
+    if (col === 'habits') return Object.keys(b).some(k => k !== 't' && k !== 'updatedAt' && b[k]);
+    return false;
   }
 
   async function connectDb() {
@@ -274,10 +322,10 @@
     if (!dbNs) { setDbState('off'); return; }
     scheduleMerge(0);
   }
-  function scheduleMerge(ms) { clearTimeout(mergeT); mergeT = setTimeout(runMerge, ms); }
+  function scheduleMerge(ms) { if (merging) return; clearTimeout(mergeT); mergeT = setTimeout(runMerge, ms); }
   async function runMerge() {
-    if (!dbNs || db) return;
-    setDbState('merging');
+    if (!dbNs || db || merging) return;
+    merging = true; setDbState('merging');
     try {
       await initialMerge();
       db = dbNs; mergeAttempt = 0;
@@ -286,15 +334,18 @@
       if (!pending.size) setDbState('synced');
     } catch (e) {
       const code = e && e.code;
-      if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') { goOffline(); return; }
-      mergeAttempt += 1; setDbState('error', e);
+      if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') { merging = false; goOffline(); return; }
+      mergeAttempt += 1; merging = false; setDbState('error', e, 'download');
       scheduleMerge([1000, 3000, 10000, 30000][Math.min(mergeAttempt - 1, 3)] + Math.random() * 500);  // keeps retrying every 30 s
+      return;
     }
+    merging = false; renderSyncState();
   }
   async function getAll(c) {
     try { return await dbNs.collection(c).get(); }
     catch (e) { if (e && e.code === 'unavailable') { await sleep(300 + Math.random() * 400); return dbNs.collection(c).get(); } throw e; }
   }
+  const legacyStamp = () => Math.max(LEGACY_TS, (state.resetAt || 0) + 1);
   async function initialMerge() {
     const remote = new Map();
     for (const c of COLLECTIONS) { const snap = await getAll(c); snap.docs.forEach(d => { if (d.exists) remote.set(docPath(c, d.id), d.data()); }); }
@@ -306,10 +357,9 @@
       if (!validPath(path)) return;
       const r = remote.get(path), l = local.get(path);
       const res = reconcile(path, l, r);
-      if (r && !isDel(pending.get(path))) lastSynced.set(path, sig(r)); else if (!r) lastSynced.delete(path);
       if (res.drop) { removeLocal(path); pending.delete(path); changed = true; return; }
       if (res.apply) { applyRemote(path, res.body); pending.delete(path); changed = true; }
-      if (res.push) { const b = res.body; if (!b.updatedAt) b.updatedAt = LEGACY_TS; baseline.set(path, sig(b)); pending.set(path, clone(b)); }
+      if (res.push) { const b = res.body; if (!b.updatedAt) b.updatedAt = legacyStamp(); baseline.set(path, sig(b)); pending.set(path, clone(b)); }
       else if (!res.apply && l && !r) pending.delete(path);
     });
     dirty = true; persistLocal();
@@ -328,13 +378,13 @@
           if (inflight.has(path)) return;                              // a write of ours is on the wire: this snapshot predates it
           if (ch.type === 'removed') {
             if (pending.has(path)) return;                            // our own newer change is still queued
-            if (l) { changed = removeLocal(path) || changed; }
+            if (!l) return;
+            if (anyContent(c, l) && !olderThanReset(l)) { baseline.delete(path); pending.set(path, clone(l)); scheduleFlush(50); return; }   // a stale device deleted an empty shell it never saw filled: our copy wins
+            changed = removeLocal(path) || changed;
             return;
           }
           const r = ch.doc.data(); if (!r) return;
-          // a queued local write is not a reason to ignore the server: both are merged three-way against the last agreed body
           const res = reconcile(path, l, r);
-          if (!isDel(pending.get(path))) lastSynced.set(path, sig(r));
           if (res.apply) changed = applyRemote(path, res.body) || changed;
           if (res.push) { const b = res.body; baseline.set(path, sig(b)); pending.set(path, clone(b)); scheduleFlush(50); }
         });
@@ -342,15 +392,23 @@
       }, (e) => {
         if (e && e.code === 'revoked') { goOffline(); return; }
         // any other terminal error kills the listener: reconnect from scratch after a pause
-        unsubs.forEach(x => { try { x(); } catch (y) {} }); unsubs = []; db = null; setDbState('error', e); scheduleMerge(3000 + Math.random() * 2000);
+        unsubs.forEach(x => { try { x(); } catch (y) {} }); unsubs = []; db = null; setDbState('error', e, 'listener'); scheduleMerge(3000 + Math.random() * 2000);
       });
       unsubs.push(u);
     });
   }
-  /* Re-render, but never under the user's fingers: wait until the focused input is left. */
+  /* Re-render, but never under the user's fingers and never through a tap: wait for an idle moment. */
   function typing() { const a = document.activeElement; return !!(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.closest('main')); }
   function requestRender() { if (typing()) { renderQueued = true; renderSyncState(); return; } renderQueued = false; render(); }
-  document.addEventListener('focusout', () => { if (renderQueued) setTimeout(() => { if (renderQueued && !typing()) { renderQueued = false; render(); } }, 50); });
+  let deferT = null;
+  function flushDeferred() { if (renderQueued && !typing()) { renderQueued = false; render(); } }
+  document.addEventListener('focusout', () => { clearTimeout(deferT); deferT = setTimeout(flushDeferred, 600); });
+  document.addEventListener('pointerdown', () => { clearTimeout(deferT); }, true);
+  document.addEventListener('click', () => { clearTimeout(deferT); deferT = setTimeout(flushDeferred, 0); });
+  /* forms that commit on a button keep what was typed across any re-render */
+  document.addEventListener('input', (e) => { const t = e.target; if (t && t.id && t.closest('main') && !t.closest('.setrow') && t.id !== 'notes' && t.id !== 'wsel') dirtyInputs.set(t.id, t.type === 'checkbox' ? t.checked : t.value); });
+  function restoreDirty(root) { dirtyInputs.forEach((v, id) => { const e = root.querySelector('#' + (window.CSS && CSS.escape ? CSS.escape(id) : id)); if (e) { if (e.type === 'checkbox') e.checked = v; else e.value = v; } }); }
+  function clearDirty(ids) { ids.forEach(id => dirtyInputs.delete(id)); }
 
   /* ---------- dates ---------- */
   function pad(n) { return String(n).padStart(2, '0'); }
@@ -485,6 +543,7 @@
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
     document.querySelectorAll('.view').forEach(v => v.hidden = v.id !== 'view-' + activeTab);
     ({ today: renderToday, plan: renderPlan, progress: renderProgress, nutrition: renderNutrition, guide: renderGuide, settings: renderSettings })[activeTab]();
+    restoreDirty(document.getElementById('view-' + activeTab));
   }
 
   /* ---------- TODAY ---------- */
@@ -537,8 +596,11 @@
     root.appendChild(wcard);
     $('#qsave').onclick = () => {
       const kg = parseFloat($('#qw').value); if (!kg) { toast('Enter a weight'); return; }
-      const waist = parseFloat($('#qwaist').value) || null;
-      state.body = state.body.filter(b => b.date !== viewDate); state.body.push({ date: viewDate, kg, waist }); save(true); toast('Saved'); render();
+      const prev = state.body.find(b => b.date === viewDate);
+      const waist = parseFloat($('#qwaist').value) || (prev ? prev.waist : null);
+      const entry = prev ? Object.assign(prev, { kg, waist }) : { date: viewDate, kg, waist };
+      if (!prev) state.body.push(entry);
+      clearDirty(['qw', 'qwaist']); save(true); toast('Saved'); render();
     };
 
     // morning timeline
@@ -590,9 +652,11 @@
     const wk = sp.workouts[chosenId];
     if (!wk) { root.appendChild(el(`<section class="card"><p class="small muted">This day was logged under a workout that no longer exists in the selected split. Pick a session above to continue.</p></section>`)); return; }
     // Nothing is written to storage until you type or tick something: viewing a day never creates a record.
-    const s = state.sessions[viewDate] || { workoutId: chosenId, splitId: spId, sets: {}, done: false, notes: '' };
-    // If another device's copy of this day arrived while you were typing, your typed values are merged in, never dropped.
-    const commit = () => { const cur = state.sessions[viewDate]; if (cur !== s) state.sessions[viewDate] = cur ? mergeSession(Object.assign({}, s, { updatedAt: Date.now() }), cur, baseOf('sessions/' + viewDate)) : s; save(); };
+    // Handlers always write into the live record, so a copy that arrives from another device mid-workout is never overwritten by a stale draft.
+    const current = () => state.sessions[viewDate] || { workoutId: chosenId, splitId: spId, sets: {}, done: false, notes: '' };
+    const live = () => { let cur = state.sessions[viewDate]; if (!cur) { cur = { workoutId: chosenId, splitId: spId, sets: {}, done: false, notes: '' }; state.sessions[viewDate] = cur; } return cur; };
+    const setCell = (ex, i, patch) => { const cur = live(); const arr = cur.sets[ex] = cur.sets[ex] || []; while (arr.length <= i) arr.push({ w: '', r: '', done: false }); Object.assign(arr[i], patch); save(); };
+    const s = current();
 
     const wcardEl = el(`<section class="card"><div class="row between"><div><div class="eyebrow">${esc(wk.focus)}</div><h2>${esc(wk.name)}</h2></div>${ph && ph.setMod === 'deload' ? '<span class="chip warn">Deload: 2 sets, −20% load</span>' : ''}</div>
       <p class="muted small">Your walk in was the general warm-up. Do 2–3 min of mobility, then ramp sets on the first lift (one extra on lower days). Rest times are per set. Tap ⏱ to start the rest timer.</p></section>`);
@@ -602,9 +666,7 @@
       const ex = EXERCISES[item.ex];
       const p = prescribe(item, ph);
       const stored = s.sets[item.ex] || [];
-      const rows = stored.slice();
-      while (rows.length < p.sets) rows.push({ w: '', r: '', done: false });
-      const own = (i) => { const arr = s.sets[item.ex] = s.sets[item.ex] || []; while (arr.length <= i) arr.push(rows[arr.length]); };
+      const rows = []; for (let i = 0; i < Math.max(p.sets, stored.length); i++) rows.push(stored[i] ? clone(stored[i]) : { w: '', r: '', done: false });
       const lp = lastPerformance(item.ex, viewDate);
       const sug = suggestion(item.ex, item, viewDate);
       const timed = isTimed(item.reps) || item.cardio;
@@ -628,12 +690,12 @@
       rows.forEach((row, i) => {
         const r = el(`<div class="setrow ${row.done ? 'done' : ''}"><span class="idx">${i + 1}</span><input type="number" step="0.5" inputmode="decimal" value="${esc(row.w)}" placeholder="${lp && lp.sets[i] ? esc(lp.sets[i].w) : ''}" aria-label="weight set ${i + 1}"><input type="number" step="1" inputmode="numeric" value="${esc(row.r)}" placeholder="${lp && lp.sets[i] ? esc(lp.sets[i].r) : ''}" aria-label="reps set ${i + 1}"><input type="checkbox" ${row.done ? 'checked' : ''} aria-label="set ${i + 1} done"></div>`);
         const [wIn, rIn, cIn] = r.querySelectorAll('input');
-        wIn.oninput = () => { own(i); row.w = wIn.value; commit(); };
-        rIn.oninput = () => { own(i); row.r = rIn.value; commit(); };
+        wIn.oninput = () => setCell(item.ex, i, { w: wIn.value });
+        rIn.oninput = () => setCell(item.ex, i, { r: rIn.value });
         cIn.onchange = () => {
-          own(i); row.done = cIn.checked;
-          if (row.done) { if (!row.w && wIn.placeholder) { row.w = wIn.placeholder; wIn.value = row.w; } if (!row.r && rIn.placeholder) { row.r = rIn.placeholder; rIn.value = row.r; } if (item.rest) startRest(item.rest); }
-          r.classList.toggle('done', row.done); commit();
+          const patch = { done: cIn.checked };
+          if (cIn.checked) { if (!wIn.value && wIn.placeholder) { wIn.value = wIn.placeholder; patch.w = wIn.value; } if (!rIn.value && rIn.placeholder) { rIn.value = rIn.placeholder; patch.r = rIn.value; } if (item.rest) startRest(item.rest); }
+          r.classList.toggle('done', cIn.checked); setCell(item.ex, i, patch);
         };
         setsEl.appendChild(r);
       });
@@ -647,8 +709,9 @@
         <button class="btn ${s.done ? '' : 'primary'} block" id="finish">${s.done ? 'Mark as not finished' : 'Finish workout'}</button>
       </section>`);
     root.appendChild(foot);
-    $('#notes').oninput = (e) => { s.notes = e.target.value; commit(); };
-    $('#finish').onclick = () => { s.done = !s.done; s.finishedAt = s.done ? new Date().toISOString() : null; commit(); save(true); toast(s.done ? 'Workout logged. Eat.' : 'Reopened'); renderToday(); };
+    restoreDirty(root);
+    $('#notes').oninput = (e) => { live().notes = e.target.value; save(); };
+    $('#finish').onclick = () => { const cur = live(); cur.done = !cur.done; cur.finishedAt = cur.done ? new Date().toISOString() : null; save(true); toast(cur.done ? 'Workout logged. Eat.' : 'Reopened'); renderToday(); };
   }
 
   /* morning timeline from wake time */
@@ -750,7 +813,7 @@
     root.appendChild(el(`<section class="card guide"><h2>${esc(GUIDE.expectations.title)}</h2>${GUIDE.expectations.body.map(t => `<p>${esc(t)}</p>`).join('')}</section>`));
 
     // splits
-    const sc = el(`<section class="card"><h2>Splits</h2><p class="muted small">The plan picks the split for each phase. Override it here if your week changes. <b>Current: ${state.settings.splitOverride ? esc(SPLITS[state.settings.splitOverride].name) + ' (override)' : 'following the plan'}</b></p><div class="stack" id="splits"></div></section>`);
+    const sc = el(`<section class="card"><h2>Splits</h2><p class="muted small">The plan picks the split for each phase. Override it here if your week changes. <b>Current: ${SPLITS[state.settings.splitOverride] ? esc(SPLITS[state.settings.splitOverride].name) + ' (override)' : 'following the plan'}</b></p><div class="stack" id="splits"></div></section>`);
     const sl = $('#splits', sc);
     const dayNames = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7'];
     Object.keys(SPLITS).forEach(id => {
@@ -814,9 +877,12 @@
       </div></section>`);
     root.appendChild(lf);
     $('#badd').onclick = () => {
-      const date = $('#bdate').value, kg = parseFloat($('#bkg').value), waist = parseFloat($('#bwaist').value) || null;
+      const date = $('#bdate').value, kg = parseFloat($('#bkg').value);
       if (!date || !kg) { toast('Date and weight needed'); return; }
-      state.body = state.body.filter(b => b.date !== date); state.body.push({ date, kg, waist }); save(true); renderProgress();
+      const prev = state.body.find(b => b.date === date);
+      const waist = parseFloat($('#bwaist').value) || (prev ? prev.waist : null);
+      if (prev) Object.assign(prev, { kg, waist }); else state.body.push({ date, kg, waist });
+      clearDirty(['bdate', 'bkg', 'bwaist']); save(true); toast('Saved'); renderProgress();
     };
 
     // weekly table
@@ -991,11 +1057,19 @@
       <button class="btn primary" id="sSave">Save settings</button></section>`);
     root.appendChild(f);
     $('#sSave').onclick = () => {
-      s.startDate = $('#sStart').value || s.startDate; s.heightCm = Number($('#sH').value) || s.heightCm; s.age = Number($('#sA').value) || s.age;
-      s.startWeightKg = Number($('#sW').value) || s.startWeightKg; s.goalKg = Number($('#sG').value) || s.goalKg; s.activity = Number($('#sAct').value) || s.activity;
-      const wt = $('#sWake').value.trim(); if (/^\d{1,2}:\d{2}$/.test(wt)) s.wakeTime = wt.padStart(5, '0');
-      s.walkToGymMin = Number($('#sWalk').value) || s.walkToGymMin;
-      s.splitOverride = $('#sSplit').value || null; save(true); toast('Saved'); render();
+      // Only fields you edited on this screen are written; everything else keeps the live value (which may have just arrived from another device).
+      const cur = state.settings, n = Object.assign({}, cur);
+      const edited = (id) => dirtyInputs.has(id);
+      if (edited('sStart') && $('#sStart').value) n.startDate = $('#sStart').value;
+      if (edited('sH') && Number($('#sH').value)) n.heightCm = Number($('#sH').value);
+      if (edited('sA') && Number($('#sA').value)) n.age = Number($('#sA').value);
+      if (edited('sW') && Number($('#sW').value)) n.startWeightKg = Number($('#sW').value);
+      if (edited('sG') && Number($('#sG').value)) n.goalKg = Number($('#sG').value);
+      if (edited('sAct') && Number($('#sAct').value)) n.activity = Number($('#sAct').value);
+      const wt = $('#sWake').value.trim(); if (edited('sWake') && /^\d{1,2}:\d{2}$/.test(wt)) n.wakeTime = wt.padStart(5, '0');
+      if (edited('sWalk') && Number($('#sWalk').value)) n.walkToGymMin = Number($('#sWalk').value);
+      if (edited('sSplit')) { const so = $('#sSplit').value; n.splitOverride = SPLITS[so] ? so : null; }
+      state.settings = n; clearDirty(['sStart', 'sH', 'sA', 'sW', 'sG', 'sAct', 'sWake', 'sWalk', 'sSplit']); save(true); toast('Saved'); render();
     };
 
     const sy = el(`<section class="card"><h3>Where your data is</h3>
@@ -1011,7 +1085,8 @@
       <textarea id="ioText" placeholder="Backup text appears here"></textarea>
       <div class="row"><button class="btn" id="ioExport">Create backup</button><button class="btn" id="ioCopy">Copy</button><button class="btn" id="ioImport">Restore from text</button></div></section>`);
     root.appendChild(io);
-    $('#ioExport').onclick = () => { $('#ioText').value = JSON.stringify(state); toast('Backup ready. Tap Copy.'); };
+    (() => { let lb = null; try { lb = JSON.parse(localStorage.getItem(BACKUP_KEY) || 'null'); } catch (e) { lb = null; } if (lb && lb.text && !dirtyInputs.has('ioText')) { $('#ioText').value = lb.text; $('#ioText').placeholder = ''; io.insertBefore(el(`<p class="small muted">Backup taken before you deleted logs on ${human(lb.date)}. Tap Restore to bring it back.</p>`), $('#ioText')); } })();
+    $('#ioExport').onclick = () => { $('#ioText').value = JSON.stringify(state); dirtyInputs.set('ioText', $('#ioText').value); toast('Backup ready. Tap Copy.'); };
     $('#ioCopy').onclick = () => {
       const ta = $('#ioText'); if (!ta.value) ta.value = JSON.stringify(state);
       const fallback = () => { ta.focus(); ta.select(); toast('Select all and copy'); };
@@ -1029,8 +1104,23 @@
         Object.keys(inc.habits).forEach(d => theirs.set('habits/' + d, inc.habits[d]));
         theirs.set('settings/main', inc.settings);
         let applied = 0;
-        theirs.forEach((r, path) => { if (!r.updatedAt) r.updatedAt = LEGACY_TS; const l = records().get(path); const res = reconcile(path, l, r); if (res.apply || (!l && res.body)) { const body = res.body || r; const [col, id] = path.split('/'); if (col === 'sessions') state.sessions[id] = body; else if (col === 'habits') state.habits[id] = body; else if (col === 'body') { state.body = state.body.filter(x => x.date !== id); state.body.push(Object.assign({ date: id }, body)); } else if (col === 'settings') state.settings = Object.assign({}, DEFAULT_SETTINGS, body); applied++; } });
-        save(true); toast(`Restored: ${applied} record${applied === 1 ? '' : 's'} added or merged`); render();
+        // A restore is a deliberate act: it beats a reset marker and any queued delete, adds what is missing,
+        // and on a conflict the newest edit still wins, so an old backup never erases newer logs.
+        theirs.forEach((r, path) => {
+          const [col, id] = path.split('/');
+          if (col === 'settings' && untouched(r)) return;
+          r.updatedAt = Math.max(ts(r), legacyStamp());
+          if (isDel(pending.get(path))) pending.delete(path);
+          const l = records().get(path);
+          let body = null;
+          if (!l) body = clone(r);
+          else { const m = mergeBodies(col, l, r); if (sig(m) !== sig(l)) { m.updatedAt = Math.max(ts(l), ts(r)) + 1; body = m; } }
+          if (!body) return;
+          if (col === 'sessions') state.sessions[id] = body; else if (col === 'habits') state.habits[id] = body; else if (col === 'body') { state.body = state.body.filter(x => x.date !== id); state.body.push(Object.assign({ date: id }, body)); } else if (col === 'settings') state.settings = Object.assign({}, DEFAULT_SETTINGS, body);
+          baseline.set(path, sig(records().get(path))); pending.set(path, clone(records().get(path))); failed.delete(path); applied++;
+        });
+        dirty = true; persistLocal(); scheduleFlush(0); clearDirty(['ioText']); try { localStorage.removeItem(BACKUP_KEY); } catch (e) {}
+        toast(`Restored: ${applied} record${applied === 1 ? '' : 's'} added or merged`); render();
       }
       catch (e) { toast('That text is not a valid backup'); }
     };
@@ -1045,9 +1135,9 @@
     $('#rs2').onclick = () => {
       if ($('#rsWord').value.trim() !== 'DELETE') return;
       const backup = JSON.stringify(state);
+      try { localStorage.setItem(BACKUP_KEY, JSON.stringify({ date: todayStr(), text: backup })); } catch (e) {}
       state.resetAt = Date.now(); state.sessions = {}; state.body = []; state.habits = {}; pending.forEach((v, k) => { if (!/^(settings|meta)\//.test(k)) pending.delete(k); });
-      save(true); toast('Logs deleted. Backup text is in the box above.'); render();
-      const ta = $('#ioText'); if (ta) ta.value = backup;
+      clearDirty(['rsWord', 'ioText']); save(true); toast('Logs deleted. Backup text is in the box above.'); render();
     };
 
     root.appendChild(el(`<section class="card"><h3>About</h3><p class="small muted">Rebuild 100 is a self-contained web app: open it on your phone, add it to the home screen, and it works offline after the first load. Training plan: Upper/Lower 4-day → U/L + Push/Pull/Legs 5-day, with upper-chest and biceps priority and a recomposition nutrition plan.</p></section>`));
