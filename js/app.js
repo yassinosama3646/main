@@ -33,6 +33,7 @@
   const dirtyInputs = new Map();        // id -> value typed into a form that commits on a button, kept across re-renders
   let viewDate = todayStr();
   let activeTab = 'today';
+  let progressEx = null;
   let restTimer = null;
   const COLLECTIONS = ['sessions', 'body', 'habits', 'settings', 'meta'];
 
@@ -244,6 +245,7 @@
     };
     let text = map[dbState] || '';
     if (f && dbState !== 'off') text += ` · ${f} record${f === 1 ? '' : 's'} could not be saved to your account`;
+    if (dbState === 'off' && Object.keys(state.sessions).length) { let last = 0; try { last = Number(localStorage.getItem(KEY + '.lastBackupAt') || 0); } catch (e) {} if (Date.now() - last > 7 * 86400000) text = 'Saved on this device only · backup overdue: Settings → Create backup → Copy'; }
     const line = document.getElementById('syncstate'); if (line) { line.textContent = text; line.dataset.state = f && dbState === 'synced' ? 'error' : dbState; }
     const chip = document.getElementById('syncchip'); if (chip) { const label = { off: 'Device only', synced: f ? 'Synced with errors' : 'Synced', error: 'Sync retrying', syncing: 'Syncing…', merging: 'Downloading…', connecting: 'Connecting…' }; chip.textContent = label[dbState] || ''; chip.className = 'chip ' + (dbState === 'synced' && !f ? 'good' : dbState === 'error' || f ? 'warn' : ''); }
     const btn = document.getElementById('syncNow'); if (btn) btn.disabled = !dbNs || merging;
@@ -659,7 +661,8 @@
     const s = current();
 
     const wcardEl = el(`<section class="card"><div class="row between"><div><div class="eyebrow">${esc(wk.focus)}</div><h2>${esc(wk.name)}</h2></div>${ph && ph.setMod === 'deload' ? '<span class="chip warn">Deload: 2 sets, −20% load</span>' : ''}</div>
-      <p class="muted small">Your walk in was the general warm-up. Do 2–3 min of mobility, then ramp sets on the first lift (one extra on lower days). Rest times are per set. Tap ⏱ to start the rest timer.</p></section>`);
+      <p class="muted small">Your walk in was the general warm-up. Do 2–3 min of mobility, then ramp sets on the first lift (one extra on lower days). Rest times are per set. Tap ⏱ to start the rest timer.</p>
+      ${wk.gnPlan ? `<p class="small"><a href="${esc(wk.gnPlan)}" target="_blank" rel="noopener">Run this session with the Gym Navigator timer ↗</a> <span class="muted">(same exercises; still log the weights here so your progression is tracked)</span></p>` : ''}</section>`);
     root.appendChild(wcardEl);
 
     wk.items.forEach((item, idx) => {
@@ -682,7 +685,7 @@
           </div>
           ${lp ? `<div class="last">Last (${human(lp.date)}): <b>${lp.sets.map(x => `${x.w || '–'}×${x.r}`).join(', ')}</b></div>` : '<div class="last">First time: pick a weight you could do for the top of the range with 3 reps spare. Write it down.</div>'}
           ${sug ? `<div class="suggest" style="${sug.kind === 'down' ? 'color:var(--bad);background:var(--bad-soft)' : sug.kind === 'hold' ? 'color:var(--muted);background:var(--surface-2)' : ''}">${sug.kind === 'up' ? '▲' : sug.kind === 'down' ? '▼' : '='} ${esc(sug.text)}</div>` : ''}
-          <details class="cue"><summary>Form cues &amp; substitutions</summary><div class="ex-cue">${esc(ex.cue)}<br><span class="muted">Swap for: ${esc(ex.sub.join(' · '))}</span></div></details>
+          <details class="cue"><summary>Form cues &amp; substitutions</summary><div class="ex-cue">${esc(ex.cue)}<br><span class="muted">Swap for: ${esc(ex.sub.join(' · '))}</span>${ex.gn ? `<br><a href="${esc(ex.gn)}" target="_blank" rel="noopener">Form guide &amp; video on Gym Navigator ↗</a>` : ''}</div></details>
           <div class="sethead"><span>Set</span><span>${timed ? 'Load / incline' : 'kg'}</span><span>${timed ? 'min / s' : 'reps'}</span><span>✓</span></div>
           <div class="sets"></div>
         </div>`);
@@ -898,6 +901,33 @@
       root.appendChild(tw);
     }
 
+    // lift progression: one exercise at a time, top set per session
+    const perEx = {};
+    Object.keys(state.sessions).sort().forEach(d => {
+      const ss = state.sessions[d]; if (!ss || !ss.sets) return;
+      Object.keys(ss.sets).forEach(ex => {
+        const sets = ss.sets[ex].map(x => ({ w: parseFloat(x.w), r: parseInt(x.r, 10) })).filter(x => x.w > 0 && x.r > 0);
+        if (!sets.length) return;
+        const top = sets.reduce((a, b) => (b.w > a.w || (b.w === a.w && b.r > a.r)) ? b : a);
+        const e1 = Math.max(...sets.map(x => x.w * (1 + x.r / 30)));
+        (perEx[ex] = perEx[ex] || []).push({ date: d, w: top.w, r: top.r, e1, vol: sets.reduce((s, x) => s + x.w * x.r, 0) });
+      });
+    });
+    const exIds = Object.keys(perEx).sort((a, b) => perEx[b].length - perEx[a].length);
+    if (exIds.length) {
+      if (!exIds.includes(progressEx)) progressEx = exIds[0];
+      const lp = el(`<section class="card"><div class="row between"><h3>Lift progression</h3></div>
+        <label class="field">Exercise<select id="exsel">${exIds.map(ex => `<option value="${ex}" ${ex === progressEx ? 'selected' : ''}>${esc(EXERCISES[ex] ? EXERCISES[ex].name : ex)} (${perEx[ex].length})</option>`).join('')}</select></label>
+        <div class="chart-wrap" id="exchart"></div>
+        <div class="tablewrap"><table class="plain"><thead><tr><th>Date</th><th class="r">Top set</th><th class="r">e1RM</th><th class="r">Volume</th><th class="r">vs first</th></tr></thead><tbody id="exrows"></tbody></table></div>
+        <p class="muted small">Top set = heaviest set of the session. e1RM = estimated one-rep max (weight × (1 + reps/30)); it rises when either weight or reps go up, so it is the honest number for "am I getting stronger".</p></section>`);
+      root.appendChild(lp);
+      const rowsEl = $('#exrows', lp); const pts = perEx[progressEx]; const first = pts[0];
+      [...pts].reverse().forEach(pt => { const d = pt.e1 - first.e1; rowsEl.appendChild(el(`<tr><td class="small">${human(pt.date)}</td><td class="r num">${pt.w} × ${pt.r}</td><td class="r num">${pt.e1.toFixed(1)}</td><td class="r num">${Math.round(pt.vol)}</td><td class="r num">${pts.length > 1 ? `<span class="chip ${d > 0 ? 'good' : d < 0 ? 'warn' : ''}">${d >= 0 ? '+' : ''}${d.toFixed(1)}</span>` : '–'}</td></tr>`)); });
+      drawLiftChart($('#exchart', lp), pts);
+      $('#exsel', lp).onchange = (e) => { progressEx = e.target.value; dirtyInputs.delete('exsel'); renderProgress(); };
+    }
+
     // PRs
     const prs = {};
     Object.keys(state.sessions).forEach(d => {
@@ -929,6 +959,32 @@
     root.appendChild(el(`<section class="card"><h3>Measure on Day 1, 50 and 100</h3><p class="small muted">Cold flexed upper arm, chest at nipple line, waist at navel, same tape, morning. Take front, side and back photos in the same light. Progress you cannot see week to week becomes obvious over 50 days.</p></section>`));
   }
 
+  function drawLiftChart(wrap, pts) {
+    wrap.innerHTML = '';
+    if (pts.length < 2) { wrap.innerHTML = '<p class="muted small">Log this exercise in two or more sessions to see the line.</p>'; return; }
+    const W = 640, H = 200, L = 44, R = 16, T = 16, B = 30;
+    const ys = pts.map(p => p.e1), ws = pts.map(p => p.w);
+    const minY = Math.floor(Math.min(...ys, ...ws) * 0.95), maxY = Math.ceil(Math.max(...ys, ...ws) * 1.05);
+    const x = i => L + i / (pts.length - 1) * (W - L - R);
+    const y = v => T + (maxY - v) / (maxY - minY || 1) * (H - T - B);
+    const step = (maxY - minY) <= 10 ? 2 : (maxY - minY) <= 30 ? 5 : 10; const ticks = []; for (let v = Math.ceil(minY / step) * step; v <= maxY; v += step) ticks.push(v);
+    const line = ys.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+    const wline = ws.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+    const svg = el(`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Estimated one-rep max and top-set weight per session">
+      ${ticks.map(v => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--font-body)">${v}</text>`).join('')}
+      <path d="${wline}" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 4" stroke-linejoin="round"/>
+      <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${pts.map((p, i) => `<circle cx="${x(i)}" cy="${y(p.e1)}" r="3.5" fill="var(--accent)" stroke="var(--surface)" stroke-width="1.5"/>`).join('')}
+      <text x="${Math.min(x(pts.length - 1) + 8, W - R - 48)}" y="${y(ys[ys.length - 1]) - 8}" font-size="12" font-weight="700" fill="var(--fg)" font-family="var(--font-body)">${ys[ys.length - 1].toFixed(1)}</text>
+      <text x="${L}" y="${H - 8}" font-size="11" fill="var(--muted)" font-family="var(--font-body)">${human(pts[0].date)}</text>
+      <text x="${W - R}" y="${H - 8}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--font-body)">${human(pts[pts.length - 1].date)}</text>
+    </svg>`);
+    wrap.appendChild(svg);
+    wrap.appendChild(el(`<div class="legend" style="margin-top:4px"><span><i style="background:var(--accent)"></i>e1RM</span><span><i style="border-top:2px dashed var(--muted);height:0;width:14px;border-radius:0"></i>top-set weight</span></div>`));
+    const tip = el(`<div class="chart-tip" hidden></div>`); wrap.appendChild(tip);
+    svg.addEventListener('mousemove', (e) => { const rect = svg.getBoundingClientRect(); const px = (e.clientX - rect.left) / rect.width * W; let best = 0; pts.forEach((p, i) => { if (Math.abs(x(i) - px) < Math.abs(x(best) - px)) best = i; }); tip.hidden = false; tip.textContent = `${human(pts[best].date)} · ${pts[best].w} × ${pts[best].r} · e1RM ${pts[best].e1.toFixed(1)}`; tip.style.left = (x(best) / W * 100) + '%'; tip.style.top = (y(pts[best].e1) / H * 100) + '%'; });
+    svg.addEventListener('mouseleave', () => tip.hidden = true);
+  }
   function drawChart(wrap, body) {
     wrap.innerHTML = '';
     if (body.length < 2) { wrap.innerHTML = '<p class="muted small">Two or more weigh-ins draw the chart.</p>'; return; }
@@ -1030,7 +1086,7 @@
       <li>Weight dropping more than 1 kg a week for two weeks despite eating the plan: see a doctor; it is not normal.</li></ul>
       <p class="muted small">This app is a training and nutrition plan written for a healthy 21-year-old. It is not medical advice.</p></section>`));
     const ex = el(`<section class="card guide"><h2>Exercise library</h2><div class="stack" id="exlib"></div></section>`);
-    Object.keys(EXERCISES).forEach(id => { const e = EXERCISES[id]; $('#exlib', ex).appendChild(el(`<details class="cue"><summary><b>${esc(e.name)}</b> <span class="muted">· ${esc(e.m)}</span></summary><div class="ex-cue">${esc(e.cue)}<br><span class="muted">Swap for: ${esc(e.sub.join(' · '))}</span></div></details>`)); });
+    Object.keys(EXERCISES).forEach(id => { const e = EXERCISES[id]; $('#exlib', ex).appendChild(el(`<details class="cue"><summary><b>${esc(e.name)}</b> <span class="muted">· ${esc(e.m)}</span></summary><div class="ex-cue">${esc(e.cue)}<br><span class="muted">Swap for: ${esc(e.sub.join(' · '))}</span>${e.gn ? `<br><a href="${esc(e.gn)}" target="_blank" rel="noopener">Form guide &amp; video on Gym Navigator ↗</a>` : ''}</div></details>`)); });
     root.appendChild(ex);
   }
 
@@ -1087,9 +1143,11 @@
     root.appendChild(io);
     (() => { let lb = null; try { lb = JSON.parse(localStorage.getItem(BACKUP_KEY) || 'null'); } catch (e) { lb = null; } if (lb && lb.text && !dirtyInputs.has('ioText')) { $('#ioText').value = lb.text; $('#ioText').placeholder = ''; io.insertBefore(el(`<p class="small muted">Backup taken before you deleted logs on ${human(lb.date)}. Tap Restore to bring it back.</p>`), $('#ioText')); } })();
     $('#ioExport').onclick = () => { $('#ioText').value = JSON.stringify(state); dirtyInputs.set('ioText', $('#ioText').value); toast('Backup ready. Tap Copy.'); };
+    const markBackedUp = () => { try { localStorage.setItem(KEY + '.lastBackupAt', String(Date.now())); } catch (e) {} renderSyncState(); };
     $('#ioCopy').onclick = () => {
       const ta = $('#ioText'); if (!ta.value) ta.value = JSON.stringify(state);
       const fallback = () => { ta.focus(); ta.select(); toast('Select all and copy'); };
+      markBackedUp();
       if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(ta.value).then(() => toast('Copied'), fallback); else fallback();
     };
     $('#ioImport').onclick = () => {
@@ -1148,4 +1206,7 @@
   try { const h = location.hash.replace('#', ''); if (['today', 'plan', 'progress', 'nutrition', 'guide', 'settings'].includes(h)) activeTab = h; } catch (e) {}
   render();
   connectDb();
+  if ('serviceWorker' in navigator && location.protocol === 'https:' && !(window.claude && typeof window.claude.use === 'function')) {
+    try { navigator.serviceWorker.register('sw.js').catch(() => {}); } catch (e) { /* not installable here */ }
+  }
 })();

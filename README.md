@@ -16,6 +16,10 @@ A self-contained gym app for a 100-day recomposition challenge. No build step, n
 | History | 103 kg at age 15, trained before (muscle memory) |
 | Priorities | Upper chest (puffy-chest history), biceps, fat loss |
 
+## Gym Navigator
+
+The four Upper/Lower sessions also exist as set-by-set timer pages on Gym Navigator (open on the phone, it walks you through each set with rest countdowns): [Upper A](https://gymnavigator.com/plan/19f5f93bd0/) · [Lower A](https://gymnavigator.com/plan/5eda7f8795/) · [Upper B](https://gymnavigator.com/plan/923f66f07e/) · [Lower B](https://gymnavigator.com/plan/36aecdd654/). Exercises that exist in its library link to the form guide and video from the app's exercise cards.
+
 ## Running it
 
 - **Phone / laptop, offline:** download the repo, open `index.html`. Chrome and Safari both keep the data between visits.

@@ -19,47 +19,47 @@ R100.DEFAULT_SETTINGS = {
 
 /* ---------- Exercise library ---------- */
 R100.EXERCISES = {
-  inc_db_press:    { name: 'Incline dumbbell press (30°)', m: 'Upper chest, front delt, triceps', cue: 'Bench at 30°, not 45°. Shoulder blades pinned back and down. Lower to nipple line, elbows ~45°. Full stretch at the bottom, do not bounce.', sub: ['Incline machine press', 'Incline barbell press', 'Low-incline Smith press'] },
+  inc_db_press:   { gn: 'https://gymnavigator.com/workout-center/exercise/603d5b7ee5ac0b00139b200b/incline-barbell-bench-press/', name: 'Incline dumbbell press (30°)', m: 'Upper chest, front delt, triceps', cue: 'Bench at 30°, not 45°. Shoulder blades pinned back and down. Lower to nipple line, elbows ~45°. Full stretch at the bottom, do not bounce.', sub: ['Incline machine press', 'Incline barbell press', 'Low-incline Smith press'] },
   flat_mach_press: { name: 'Machine chest press', m: 'Mid chest, triceps', cue: 'Seat height so handles sit at mid-chest. Drive through, squeeze chest at lockout without rolling shoulders forward.', sub: ['Flat dumbbell press', 'Barbell bench press'] },
-  bench_press:     { name: 'Barbell bench press', m: 'Chest, triceps, front delt', cue: 'Feet planted, slight arch, bar to lower chest. Touch, pause a beat, press. Always use a spotter or safeties.', sub: ['Flat dumbbell press', 'Machine chest press'] },
-  cable_fly_low:   { name: 'Low-to-high cable fly', m: 'Upper chest', cue: 'Pulleys at the bottom. Slight elbow bend locked in. Sweep up and in until hands meet at upper chest, squeeze 1 s. Light weight, perfect form.', sub: ['Incline dumbbell fly', 'Pec deck (seat low)'] },
-  pec_deck:        { name: 'Pec deck / cable fly', m: 'Chest', cue: 'Elbows slightly below shoulder height. Open to a stretch you can control, close with the chest, not the hands.', sub: ['Flat cable fly', 'Dumbbell fly'] },
+  bench_press:    { gn: 'https://gymnavigator.com/workout-center/exercise/603d5b7ee5ac0b00139b200b/incline-barbell-bench-press/', name: 'Barbell bench press', m: 'Chest, triceps, front delt', cue: 'Feet planted, slight arch, bar to lower chest. Touch, pause a beat, press. Always use a spotter or safeties.', sub: ['Flat dumbbell press', 'Machine chest press'] },
+  cable_fly_low:  { gn: 'https://gymnavigator.com/workout-center/exercise/243/low-cable-chest-fly/', name: 'Low-to-high cable fly', m: 'Upper chest', cue: 'Pulleys at the bottom. Slight elbow bend locked in. Sweep up and in until hands meet at upper chest, squeeze 1 s. Light weight, perfect form.', sub: ['Incline dumbbell fly', 'Pec deck (seat low)'] },
+  pec_deck:       { gn: 'https://gymnavigator.com/workout-center/exercise/14/standing-cable-chest-fly/', name: 'Pec deck / cable fly', m: 'Chest', cue: 'Elbows slightly below shoulder height. Open to a stretch you can control, close with the chest, not the hands.', sub: ['Flat cable fly', 'Dumbbell fly'] },
   dips:            { name: 'Chest dips (assisted if needed)', m: 'Lower chest, triceps', cue: 'Lean forward 20–30°, elbows out slightly, descend until upper arm is parallel. Stop if the front of the shoulder hurts.', sub: ['Decline machine press', 'Machine dip'] },
 
-  cs_row:          { name: 'Chest-supported row', m: 'Upper back, lats, rear delt, biceps', cue: 'Chest glued to the pad. Pull elbows back and down, pause 1 s with shoulder blades squeezed. No heaving.', sub: ['Seated cable row', 'T-bar row', 'Machine row'] },
-  cable_row:       { name: 'Seated cable row', m: 'Mid back, lats, biceps', cue: 'Torso upright and still. Pull to the lower ribs, elbows close. Let the shoulders protract forward on the stretch.', sub: ['Chest-supported row', 'Machine row'] },
-  lat_pulldown:    { name: 'Lat pulldown', m: 'Lats, biceps', cue: 'Grip just wider than shoulders. Lean back 10–15°, pull the bar to the upper chest while driving elbows to the hips. Control the way up.', sub: ['Assisted pull-up', 'Neutral-grip pulldown'] },
+  cs_row:         { gn: 'https://gymnavigator.com/workout-center/exercise/7013/chest-supported-dumbbell-row/', name: 'Chest-supported row', m: 'Upper back, lats, rear delt, biceps', cue: 'Chest glued to the pad. Pull elbows back and down, pause 1 s with shoulder blades squeezed. No heaving.', sub: ['Seated cable row', 'T-bar row', 'Machine row'] },
+  cable_row:      { gn: 'https://gymnavigator.com/workout-center/exercise/167/seated-cable-row/', name: 'Seated cable row', m: 'Mid back, lats, biceps', cue: 'Torso upright and still. Pull to the lower ribs, elbows close. Let the shoulders protract forward on the stretch.', sub: ['Chest-supported row', 'Machine row'] },
+  lat_pulldown:   { gn: 'https://gymnavigator.com/workout-center/exercise/5fe999062a8cf830382df9d2/wide-grip-lat-pulldown/', name: 'Lat pulldown', m: 'Lats, biceps', cue: 'Grip just wider than shoulders. Lean back 10–15°, pull the bar to the upper chest while driving elbows to the hips. Control the way up.', sub: ['Assisted pull-up', 'Neutral-grip pulldown'] },
   pullup:          { name: 'Pull-up (band or machine assisted)', m: 'Lats, biceps, grip', cue: 'Start from a dead hang. Chin over bar, then lower in 2–3 s. Use assistance so every set hits the target reps.', sub: ['Lat pulldown', 'Neutral-grip pulldown'] },
   db_row:          { name: 'One-arm dumbbell row', m: 'Lats, mid back, biceps', cue: 'Knee and hand on the bench. Row to the hip, not the armpit. Pause at the top; let the weight stretch you at the bottom.', sub: ['Single-arm cable row', 'Machine row'] },
-  face_pull:       { name: 'Face pull', m: 'Rear delt, rotator cuff, upper back', cue: 'Rope at face height. Pull toward the forehead, elbows high, finish with fists beside the ears. This keeps shoulders healthy.', sub: ['Rear delt fly', 'Band pull-apart'] },
+  face_pull:      { gn: 'https://gymnavigator.com/workout-center/exercise/6399/face-pull/', name: 'Face pull', m: 'Rear delt, rotator cuff, upper back', cue: 'Rope at face height. Pull toward the forehead, elbows high, finish with fists beside the ears. This keeps shoulders healthy.', sub: ['Rear delt fly', 'Band pull-apart'] },
 
   db_shoulder_press:{ name: 'Seated dumbbell shoulder press', m: 'Front and side delts, triceps', cue: 'Back pad slightly short of vertical. Dumbbells to ear height, press up and slightly in. Do not flare the ribs.', sub: ['Machine shoulder press', 'Standing barbell press'] },
-  ohp:             { name: 'Standing barbell overhead press', m: 'Delts, triceps, core', cue: 'Bar on the collarbone, squeeze glutes, press straight up and push the head through at the top.', sub: ['Seated dumbbell shoulder press', 'Machine shoulder press'] },
-  lat_raise:       { name: 'Cable lateral raise', m: 'Side delt', cue: 'Cable set low, handle crossing the body. Lead with the elbow, raise to shoulder height, lower slowly. Light, strict, lots of reps.', sub: ['Dumbbell lateral raise', 'Machine lateral raise'] },
+  ohp:            { gn: 'https://gymnavigator.com/workout-center/exercise/617245a7a0c3f700143e7fd8/barbell-overhead-press/', name: 'Standing barbell overhead press', m: 'Delts, triceps, core', cue: 'Bar on the collarbone, squeeze glutes, press straight up and push the head through at the top.', sub: ['Seated dumbbell shoulder press', 'Machine shoulder press'] },
+  lat_raise:      { gn: 'https://gymnavigator.com/workout-center/exercise/61a7235a8f3555001474fb5d/standing-cable-lateral-raise/', name: 'Cable lateral raise', m: 'Side delt', cue: 'Cable set low, handle crossing the body. Lead with the elbow, raise to shoulder height, lower slowly. Light, strict, lots of reps.', sub: ['Dumbbell lateral raise', 'Machine lateral raise'] },
 
-  inc_db_curl:     { name: 'Incline dumbbell curl', m: 'Biceps (long head, stretched position)', cue: 'Bench at 45–60°, arms hanging straight down behind you. Curl without moving the upper arm, lower all the way. This is your main biceps builder.', sub: ['Bayesian cable curl', 'Seated dumbbell curl'] },
-  preacher_curl:   { name: 'Preacher curl (EZ-bar or machine)', m: 'Biceps (short head, peak contraction)', cue: 'Armpits over the top of the pad. Lower until the arm is almost straight, curl until the forearm is vertical. No swinging.', sub: ['Machine preacher curl', 'Spider curl'] },
-  hammer_curl:     { name: 'Hammer curl', m: 'Brachialis, brachioradialis, biceps', cue: 'Neutral grip, thumbs up. Curl to shoulder height, elbows pinned. Builds arm thickness and width.', sub: ['Rope cable hammer curl', 'Cross-body hammer curl'] },
+  inc_db_curl:    { gn: 'https://gymnavigator.com/workout-center/exercise/940/incline-dumbbell-curl/', name: 'Incline dumbbell curl', m: 'Biceps (long head, stretched position)', cue: 'Bench at 45–60°, arms hanging straight down behind you. Curl without moving the upper arm, lower all the way. This is your main biceps builder.', sub: ['Bayesian cable curl', 'Seated dumbbell curl'] },
+  preacher_curl:  { gn: 'https://gymnavigator.com/workout-center/exercise/6179b7c1a352790014c7975e/barbell-close-grip-preacher-curl/', name: 'Preacher curl (EZ-bar or machine)', m: 'Biceps (short head, peak contraction)', cue: 'Armpits over the top of the pad. Lower until the arm is almost straight, curl until the forearm is vertical. No swinging.', sub: ['Machine preacher curl', 'Spider curl'] },
+  hammer_curl:    { gn: 'https://gymnavigator.com/workout-center/exercise/202/hammer-curl/', name: 'Hammer curl', m: 'Brachialis, brachioradialis, biceps', cue: 'Neutral grip, thumbs up. Curl to shoulder height, elbows pinned. Builds arm thickness and width.', sub: ['Rope cable hammer curl', 'Cross-body hammer curl'] },
   bayesian_curl:   { name: 'Bayesian cable curl', m: 'Biceps (long head, stretched)', cue: 'Face away from a low pulley, step forward so the arm is pulled behind you. Curl with the upper arm fixed. Deep stretch, slow negative.', sub: ['Incline dumbbell curl'] },
   ez_curl:         { name: 'EZ-bar curl', m: 'Biceps', cue: 'Elbows tucked at the sides, curl to the chest, 2 s negative. Pick a weight you can lift strictly.', sub: ['Barbell curl', 'Cable curl'] },
 
-  pushdown:        { name: 'Rope triceps pushdown', m: 'Triceps (lateral head)', cue: 'Elbows pinned to the sides. Push down and split the rope at the bottom. Keep the shoulders still.', sub: ['Straight-bar pushdown', 'Machine triceps extension'] },
-  oh_tri_ext:      { name: 'Overhead cable triceps extension', m: 'Triceps (long head)', cue: 'Face away from the cable, rope behind the head. Extend until arms are straight, let the rope stretch the triceps on the way back.', sub: ['Dumbbell overhead extension', 'Skull crusher'] },
+  pushdown:       { gn: 'https://gymnavigator.com/workout-center/exercise/269/triceps-pushdown/', name: 'Rope triceps pushdown', m: 'Triceps (lateral head)', cue: 'Elbows pinned to the sides. Push down and split the rope at the bottom. Keep the shoulders still.', sub: ['Straight-bar pushdown', 'Machine triceps extension'] },
+  oh_tri_ext:     { gn: 'https://gymnavigator.com/workout-center/exercise/5ff8949385da59000f4079fa/triceps-overhead-cable-extension/', name: 'Overhead cable triceps extension', m: 'Triceps (long head)', cue: 'Face away from the cable, rope behind the head. Extend until arms are straight, let the rope stretch the triceps on the way back.', sub: ['Dumbbell overhead extension', 'Skull crusher'] },
   skullcrusher:    { name: 'EZ-bar skull crusher', m: 'Triceps', cue: 'Lower the bar behind the top of the head, not to the forehead. Elbows pointed at the ceiling.', sub: ['Overhead cable triceps extension'] },
 
   leg_press:       { name: 'Leg press', m: 'Quads, glutes', cue: 'Feet shoulder width, mid-platform. Lower until thighs touch the torso without the lower back rounding. Do not lock knees hard.', sub: ['Hack squat', 'Goblet squat'] },
   hack_squat:      { name: 'Hack squat', m: 'Quads, glutes', cue: 'Feet lower on the platform for more quad. Go deep, drive through the whole foot.', sub: ['Leg press', 'Back squat'] },
-  goblet_squat:    { name: 'Goblet squat', m: 'Quads, glutes, core', cue: 'Dumbbell held at the chest, elbows inside the knees at the bottom, chest tall. Good re-entry squat for week 1–3.', sub: ['Leg press', 'Back squat'] },
+  goblet_squat:   { gn: 'https://gymnavigator.com/workout-center/exercise/6299/goblet-squat/', name: 'Goblet squat', m: 'Quads, glutes, core', cue: 'Dumbbell held at the chest, elbows inside the knees at the bottom, chest tall. Good re-entry squat for week 1–3.', sub: ['Leg press', 'Back squat'] },
   back_squat:      { name: 'Barbell back squat', m: 'Quads, glutes, core', cue: 'Bar on the upper back, brace hard, sit down between the hips, drive up. Depth: hip crease at or below knee.', sub: ['Hack squat', 'Leg press'] },
   rdl:             { name: 'Romanian deadlift (dumbbell or barbell)', m: 'Hamstrings, glutes, lower back', cue: 'Soft knees, push hips back, bar stays touching the thighs. Stop when the hamstrings are fully stretched (usually mid-shin). Flat back the whole time.', sub: ['45° back extension', 'Lying leg curl'] },
   hip_thrust:      { name: 'Barbell hip thrust', m: 'Glutes, hamstrings', cue: 'Upper back on a bench, shins vertical at the top, chin tucked. Squeeze glutes hard for 1 s at the top.', sub: ['Machine hip thrust', 'Glute bridge'] },
-  bss:             { name: 'Bulgarian split squat', m: 'Quads, glutes (single leg)', cue: 'Rear foot on a bench, front shin near vertical. Lower until the rear knee almost touches. Hold dumbbells only once bodyweight is easy.', sub: ['Walking lunge', 'Reverse lunge'] },
-  walking_lunge:   { name: 'Walking lunge', m: 'Quads, glutes', cue: 'Long step, torso upright, rear knee to just above the floor. Push through the front heel.', sub: ['Bulgarian split squat', 'Reverse lunge'] },
+  bss:            { gn: 'https://gymnavigator.com/workout-center/exercise/61a3f80e1a06050014502d61/dumbbell-overhead-bulgarian-split-squat/', name: 'Bulgarian split squat', m: 'Quads, glutes (single leg)', cue: 'Rear foot on a bench, front shin near vertical. Lower until the rear knee almost touches. Hold dumbbells only once bodyweight is easy.', sub: ['Walking lunge', 'Reverse lunge'] },
+  walking_lunge:  { gn: 'https://gymnavigator.com/workout-center/exercise/4235/walking-lunge/', name: 'Walking lunge', m: 'Quads, glutes', cue: 'Long step, torso upright, rear knee to just above the floor. Push through the front heel.', sub: ['Bulgarian split squat', 'Reverse lunge'] },
   leg_curl:        { name: 'Lying or seated leg curl', m: 'Hamstrings', cue: 'Curl all the way, 2–3 s on the way back. Point toes to make it harder.', sub: ['Nordic curl (eccentric only)', 'Swiss ball leg curl'] },
   leg_ext:         { name: 'Leg extension', m: 'Quads (rectus femoris)', cue: 'Lean back slightly, extend fully, squeeze 1 s, lower under control.', sub: ['Sissy squat', 'Goblet squat (high reps)'] },
   calf_stand:      { name: 'Standing calf raise', m: 'Gastrocnemius', cue: 'Full stretch at the bottom for 1 s, full rise, no bouncing. The bottom position is where calves grow.', sub: ['Leg-press calf raise', 'Smith-machine calf raise'] },
   calf_seated:     { name: 'Seated calf raise', m: 'Soleus', cue: 'Same rule: pause at the stretch, slow tempo, high reps.', sub: ['Standing calf raise'] },
-  cable_crunch:    { name: 'Cable crunch', m: 'Abs', cue: 'Kneel, rope behind the head, curl the ribs toward the pelvis. Hips stay still.', sub: ['Machine crunch', 'Weighted decline crunch'] },
+  cable_crunch:   { gn: 'https://gymnavigator.com/workout-center/exercise/370/standing-cable-crunch/', name: 'Cable crunch', m: 'Abs', cue: 'Kneel, rope behind the head, curl the ribs toward the pelvis. Hips stay still.', sub: ['Machine crunch', 'Weighted decline crunch'] },
   hanging_knee_raise:{ name: 'Hanging knee raise', m: 'Lower abs, hip flexors', cue: 'Tilt the pelvis up at the top (tuck the tailbone). Slow, no swinging. Use captain’s chair if grip gives out.', sub: ['Reverse crunch', 'Lying leg raise'] },
   plank:           { name: 'Plank or ab-wheel rollout', m: 'Core', cue: 'Ribs down, glutes tight, hold 30–60 s or 6–10 controlled rollouts.', sub: ['Dead bug', 'Hollow hold'] },
   incline_walk:    { name: 'Incline treadmill walk (zone 2)', m: 'Cardio, fat loss', cue: '10–12% incline, 5–6 km/h, 20–30 min. You should be able to talk in short sentences. No sprinting required.', sub: ['Bike (easy pace)', 'Stairmaster (slow)', '30-minute outdoor brisk walk'] },
@@ -79,7 +79,7 @@ R100.SPLITS = {
     why: 'Every muscle is trained twice a week, which beats once-a-week when total sets are equal. Four sessions leave three recovery days, which matters while your joints and tendons re-adapt. Direct biceps work fits three times a week without exhausting you.',
     pattern: ['ua', 'la', null, 'ub', 'lb', null, null],
     workouts: {
-      ua: { name: 'Upper A — Chest & back strength', focus: 'Upper chest, back, biceps', items: [
+      ua: { gnPlan: 'https://gymnavigator.com/plan/19f5f93bd0/', name: 'Upper A — Chest & back strength', focus: 'Upper chest, back, biceps', items: [
         X('inc_db_press', 3, '8–10', 150, { priority: true, note: 'Main lift. Upper chest first while fresh.' }),
         X('cs_row', 3, '8–10', 120),
         X('flat_mach_press', 2, '10–12', 90),
@@ -89,7 +89,7 @@ R100.SPLITS = {
         X('pushdown', 2, '12–15', 60),
         X('cable_fly_low', 2, '12–15', 60, { priority: true, note: 'Upper chest finisher. Light, squeeze.' }),
       ]},
-      la: { name: 'Lower A — Quads & posterior', focus: 'Quads, hamstrings, calves, abs', items: [
+      la: { gnPlan: 'https://gymnavigator.com/plan/5eda7f8795/', name: 'Lower A — Quads & posterior', focus: 'Quads, hamstrings, calves, abs', items: [
         X('leg_press', 3, '8–10', 150, { note: 'Weeks 1–3 you may use goblet squat if you prefer.' }),
         X('rdl', 3, '8–10', 150),
         X('bss', 2, '10 / leg', 90),
@@ -98,7 +98,7 @@ R100.SPLITS = {
         X('hanging_knee_raise', 3, '12–15', 60),
         X('incline_walk', 1, '20 min', 0, { cardio: true, note: 'Optional: do it here, or take a 30-minute route home instead of the 12-minute one.' }),
       ]},
-      ub: { name: 'Upper B — Back & arms', focus: 'Lats, side delts, biceps, triceps', items: [
+      ub: { gnPlan: 'https://gymnavigator.com/plan/923f66f07e/', name: 'Upper B — Back & arms', focus: 'Lats, side delts, biceps, triceps', items: [
         X('pullup', 3, '6–10', 150, { note: 'Assisted is fine. Goal: 3×10 unassisted by Day 100.' }),
         X('inc_db_press', 3, '10–12', 120, { priority: true, note: 'Second upper-chest exposure, lighter and higher reps.' }),
         X('db_row', 3, '10–12', 90),
@@ -109,7 +109,7 @@ R100.SPLITS = {
         X('oh_tri_ext', 2, '12–15', 60),
         X('face_pull', 2, '15–20', 45),
       ]},
-      lb: { name: 'Lower B — Hips & arms finisher', focus: 'Quads, glutes, calves, core, biceps touch-up', items: [
+      lb: { gnPlan: 'https://gymnavigator.com/plan/36aecdd654/', name: 'Lower B — Hips & arms finisher', focus: 'Quads, glutes, calves, core, biceps touch-up', items: [
         X('hack_squat', 3, '10–12', 150, { note: 'Or leg press with feet lower on the platform.' }),
         X('hip_thrust', 3, '10–12', 120),
         X('leg_ext', 2, '12–15', 75),
